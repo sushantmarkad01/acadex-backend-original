@@ -355,6 +355,54 @@ app.post('/createUser', async (req, res) => {
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
+// New route for Bulk Student Creation
+app.post('/bulkCreateStudents', async (req, res) => {
+  try {
+    const { students, instituteId, instituteName } = req.body;
+    const results = { success: [], errors: [] };
+
+    for (const student of students) {
+      try {
+        // 1. Create Auth Account
+        const userRecord = await admin.auth().createUser({
+          email: student.email,
+          password: Math.random().toString(36).slice(-8), // Temporary random password
+          displayName: `${student.firstName} ${student.lastName}`
+        });
+
+        // 2. Prepare Firestore Doc (matching your existing schema)
+        const userDoc = {
+          uid: userRecord.uid,
+          email: student.email,
+          role: 'student',
+          firstName: student.firstName,
+          lastName: student.lastName,
+          instituteId,
+          instituteName,
+          department: student.department,
+          rollNo: student.rollNo,
+          collegeId: student.collegeId,
+          year: student.year,
+          semester: student.semester,
+          xp: 0,
+          badges: [],
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        await admin.firestore().collection('users').doc(userRecord.uid).set(userDoc);
+        await admin.auth().setCustomUserClaims(userRecord.uid, { role: 'student', instituteId });
+        
+        results.success.push(student.email);
+      } catch (err) {
+        results.errors.push({ email: student.email, error: err.message });
+      }
+    }
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Route 2: Mark Attendance
 app.post('/markAttendance', async (req, res) => {
   try {
