@@ -341,16 +341,24 @@ app.get('/health', (req, res) => res.json({ status: 'ok', demoMode: DEMO_MODE })
 // 1. Create User
 app.post('/createUser', async (req, res) => {
   try {
-    const { email, password, firstName, lastName, role, instituteId, instituteName, department, subject, rollNo, qualification, extras = {} } = req.body;
+    const { email, password, firstName, lastName, role, instituteId, instituteName, department, subject, assignedYears, rollNo, qualification, extras = {} } = req.body;
+    
     const userRecord = await admin.auth().createUser({ email, password, displayName: `${firstName} ${lastName}` });
+    
     const userDoc = { 
         uid: userRecord.uid, email, role, firstName, lastName, instituteId, instituteName, 
-        department: department || null, subject: subject || null, rollNo: rollNo || null, qualification: qualification || null,
+        department: department || null, 
+        subject: subject || null, 
+        assignedYears: assignedYears || [], // ✅ Store Assigned Years (e.g. ['SE', 'TE'])
+        rollNo: rollNo || null, 
+        qualification: qualification || null,
         xp: 0, badges: [], 
         createdAt: admin.firestore.FieldValue.serverTimestamp(), ...extras 
     };
+
     await admin.firestore().collection('users').doc(userRecord.uid).set(userDoc);
     await admin.auth().setCustomUserClaims(userRecord.uid, { role, instituteId });
+    
     return res.json({ message: 'User created successfully', uid: userRecord.uid });
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
@@ -404,6 +412,7 @@ app.post('/bulkCreateStudents', async (req, res) => {
 });
 
 // Route 2: Mark Attendance
+// ✅ UPDATE: Strict Attendance Marking
 app.post('/markAttendance', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -414,14 +423,13 @@ app.post('/markAttendance', async (req, res) => {
     const studentUid = decoded.uid;
     const { sessionId, studentLocation } = req.body;
 
-    // Dynamic QR Check
     const [realSessionId, timestamp] = sessionId.split('|');
     if (!realSessionId) return res.status(400).json({ error: 'Invalid QR Code' });
 
+    // QR Expiry Check (15 seconds)
     if (timestamp) {
         const qrTime = parseInt(timestamp);
-        const timeDiff = (Date.now() - qrTime) / 1000;
-        if (timeDiff > 15) return res.status(400).json({ error: 'QR Code Expired!' });
+        if ((Date.now() - qrTime) / 1000 > 15) return res.status(400).json({ error: 'QR Code Expired!' });
     }
 
     const sessionRef = admin.firestore().collection('live_sessions').doc(realSessionId);
@@ -437,14 +445,21 @@ app.post('/markAttendance', async (req, res) => {
         if (dist > ACCEPTABLE_RADIUS_METERS) return res.status(403).json({ error: `Too far! You are ${Math.round(dist)}m away.` });
     }
 
-    const userRef = admin.firestore().collection('users').doc(studentUid); // Reference to student
+    const userRef = admin.firestore().collection('users').doc(studentUid);
     const userDoc = await userRef.get();
     const studentData = userDoc.data();
 
-    // 1. Create the "Receipt" (Log Entry)
+    // 🔒 SECURITY: Strict Year Check
+    // If the session has a specific year (not 'All'), reject students from other years.
+    if (session.targetYear && session.targetYear !== 'All' && studentData.year !== session.targetYear) {
+       return res.status(403).json({ error: `⛔ This class is strictly for ${session.targetYear} students.` });
+    }
+
+    // Mark Attendance
     await admin.firestore().collection('attendance').doc(`${realSessionId}_${studentUid}`).set({
       sessionId: realSessionId,
       subject: session.subject || 'Class',
+      targetYear: session.targetYear || 'All', // Save year for filtering reports
       studentId: studentUid,
       studentEmail: studentData.email,
       firstName: studentData.firstName,
@@ -455,10 +470,7 @@ app.post('/markAttendance', async (req, res) => {
       status: 'Present'
     });
 
-    // 2. UPDATE THE SCOREBOARD (Increment Count)
-    await userRef.update({
-        attendanceCount: admin.firestore.FieldValue.increment(1)
-    });
+    await userRef.update({ attendanceCount: admin.firestore.FieldValue.increment(1) });
 
     return res.json({ message: 'Attendance Marked Successfully!' });
 
@@ -467,7 +479,6 @@ app.post('/markAttendance', async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-
 // 3. AI Chatbot (Groq)
 app.post('/chat', async (req, res) => {
     try {
