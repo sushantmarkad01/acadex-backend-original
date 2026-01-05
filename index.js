@@ -795,14 +795,14 @@ app.post('/checkStatus', async (req, res) => {
   }
 });
 
-// 19. Generate Full Quiz (Legacy/Specific Endpoint)
+// 19. Generate Full Quiz (Fixed)
 app.post('/generateQuiz', async (req, res) => {
     try {
         const { department, semester, careerGoal } = req.body;
-        const apiKey = process.env.GROQ_API_KEY;
-
-        const systemPrompt = `
-            You are a professor creating a quick-fire quiz.
+        
+        const systemPrompt = "You are a university professor creating a quick-fire quiz.";
+        
+        const userPrompt = `
             Generate 10 Multiple Choice Questions (MCQs) for a ${department} student in Semester ${semester}.
             Focus on topics relevant to: "${careerGoal}".
             
@@ -811,30 +811,22 @@ app.post('/generateQuiz', async (req, res) => {
               "questions": [
                 {
                   "question": "Question text here?",
-                  "options": ["Option A", "Option B", "Option C", "Option D"],
-                  "answer": "Option A",
-                  "explanation": "Short explanation of why A is correct."
+                  "options": ["Detailed Option 1", "Detailed Option 2", "Detailed Option 3", "Detailed Option 4"],
+                  "answer": "Detailed Option 1",
+                  "explanation": "Short explanation of why this option is correct."
                 }
               ]
             }
+
+            CRITICAL RULES:
+            1. The "answer" field MUST be an EXACT string copy of the correct option from the "options" array.
+            2. Do NOT use prefixes like "A.", "B." or "1." in the options strings unless they are part of the answer text.
+            3. Do NOT return the index or the letter (e.g., do NOT return "A" or "0"). Return the full text string.
         `;
 
-        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-            method: "POST",
-            headers: { 
-                "Authorization": `Bearer ${apiKey}`, 
-                "Content-Type": "application/json" 
-            },
-            body: JSON.stringify({ 
-                messages: [{ role: "system", content: systemPrompt }], 
-                model: "llama-3.3-70b-versatile",
-                response_format: { type: "json_object" } 
-            })
-        });
-
-        const data = await response.json();
-        const cleanJson = data.choices[0].message.content.replace(/```json|```/g, '').trim();
-        res.json(JSON.parse(cleanJson));
+        // Use the helper function for robust parsing
+        const quizData = await callGroqAI(systemPrompt, userPrompt, true);
+        res.json(quizData);
 
     } catch (error) {
         console.error("Quiz Gen Error:", error);
