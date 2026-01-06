@@ -339,17 +339,34 @@ app.post('/quizAttempt', async (req, res) => {
 app.get('/health', (req, res) => res.json({ status: 'ok', demoMode: DEMO_MODE }));
 
 // 1. Create User
+// ✅ UPDATE: Create User (Supports Multiple Subjects per Year)
 app.post('/createUser', async (req, res) => {
   try {
-    const { email, password, firstName, lastName, role, instituteId, instituteName, department, subject, assignedYears, rollNo, qualification, extras = {} } = req.body;
+    const { email, password, firstName, lastName, role, instituteId, instituteName, department, assignedClasses, rollNo, qualification, extras = {} } = req.body;
     
+    // Validate assignedClasses for teachers
+    let finalAssignedClasses = [];
+    if (role === 'teacher') {
+        if (assignedClasses && Array.isArray(assignedClasses)) {
+            finalAssignedClasses = assignedClasses; // Expecting [{ year: 'SE', subject: 'Math' }, ...]
+        } else {
+            // Fallback for old requests (backwards compatibility)
+            const { subject, assignedYears } = req.body;
+            if (assignedYears && subject) {
+                finalAssignedClasses = assignedYears.map(y => ({ year: y, subject: subject }));
+            }
+        }
+    }
+
     const userRecord = await admin.auth().createUser({ email, password, displayName: `${firstName} ${lastName}` });
     
     const userDoc = { 
         uid: userRecord.uid, email, role, firstName, lastName, instituteId, instituteName, 
-        department: department || null, 
-        subject: subject || null, 
-        assignedYears: assignedYears || [], // ✅ Store Assigned Years (e.g. ['SE', 'TE'])
+        department: department || null,
+        assignedClasses: finalAssignedClasses, // ✅ Store Year-Subject Mapping
+        // Keep legacy fields for safety, but UI should prefer assignedClasses
+        subject: finalAssignedClasses.length > 0 ? finalAssignedClasses[0].subject : null, 
+        assignedYears: finalAssignedClasses.map(c => c.year),
         rollNo: rollNo || null, 
         qualification: qualification || null,
         xp: 0, badges: [], 
