@@ -1173,79 +1173,57 @@ app.post('/startInteractiveTask', taskLimiter, async (req, res) => {
 });
 
 // 2. SUBMIT & GRADE
-app.post('/submitInteractiveTask', async (req, res) => {
+app.post('/startInteractiveTask', taskLimiter, async (req, res) => {
     try {
-        const { uid, taskType, submission, context } = req.body;
-        const userRef = admin.firestore().collection('users').doc(uid);
+        const { taskType, userInterest, difficulty } = req.body; 
+        
+        let systemPrompt = "";
+        let userPrompt = "";
 
-        let passed = false;
-        let feedback = "";
-        let hint = null; // New "Smart Hint" feature
-        let creditsEarned = 0;
-
-        // --- A. CODING CHALLENGE (Smart Tutor Mode) ---
-        if (taskType === 'Coding') {
-            const systemPrompt = `
-                You are a Code Reviewer. 
-                Task: ${context.problemStatement}
-                Student Code: ${submission.code}
-                
-                Rules:
-                1. If logic is correct, return JSON: { "passed": true, "feedback": "Great job!" }
-                2. If WRONG, return JSON: { "passed": false, "hint": "Give a specific clue (e.g. 'Check your variable scope'), do NOT give the full answer." }
-            `;
-            
-            const aiCheck = await callGroqAI("Code Mentor", systemPrompt, true);
-            
-            passed = aiCheck.passed;
-            if (passed) {
-                feedback = aiCheck.feedback || "Code Verified! Excellent logic.";
-                creditsEarned = 50;
-            } else {
-                hint = aiCheck.hint || "Something is off. Check your syntax.";
-                feedback = "Keep trying! See the hint below.";
-            }
+        // 🔥 MODE 1: SIMULATION
+        if (taskType === 'Simulation') {
+            systemPrompt = "You are a Career Simulator. Output strictly valid JSON.";
+            userPrompt = `Create a high-stakes scenario for a "${userInterest}" professional.
+            Situation: A critical problem (server crash, angry client, etc).
+            JSON Format: { "title": "...", "scenario": "...", "role": "...", "options": ["A", "B", "C", "D"], "correctIndex": 1, "consequence": "..." }`;
         }
+        // 🕵️ MODE 2: MYSTERY
+        else if (taskType === 'Mystery') {
+            systemPrompt = "You are a Logic Master. Output strictly valid JSON.";
+            userPrompt = `Create a logic puzzle related to "${userInterest}".
+            JSON Format: { "title": "...", "scenario": "...", "role": "...", "options": ["...", "...", "...", "..."], "correctIndex": 2, "consequence": "..." }`;
+        } 
+        // 💻 MODE 3: CODING
+        else if (taskType === 'Coding') {
+            const level = difficulty || 'Easy';
+            systemPrompt = "You are a Senior Tech Lead. Output strictly valid JSON.";
+            userPrompt = `Generate a ${level} level coding challenge related to "${userInterest}".
+            
+            Difficulty Guidelines:
+            - Easy: Basic syntax, loops, string manipulation, or simple if-else logic.
+            - Medium: Arrays, functions, object manipulation, or basic algorithms (sorting/search).
+            - Hard: Optimization, recursion, complex data structures, or edge case handling.
 
-        // --- B. TYPING TEST (Speed & Accuracy) ---
+            JSON Format: { "title": "...", "scenario": "Your goal is to...", "starterCode": "...", "expectedOutput": "..." }`;
+        }
+        // ⌨️ MODE 4: TYPING
         else if (taskType === 'Typing') {
-            // Context.targetText is the original paragraph
-            const { wpm, accuracy } = submission;
-            
-            // Hard Rules: >30 WPM and >90% Accuracy
-            if (wpm >= 30 && accuracy >= 90) {
-                passed = true;
-                creditsEarned = 30;
-                feedback = `🔥 Fast Fingers! ${wpm} WPM & ${accuracy}% Accuracy.`;
-            } else {
-                passed = false;
-                feedback = `Too slow or inaccurate. You need >30 WPM and >90% Accuracy. (You: ${wpm} WPM, ${accuracy}%)`;
-            }
+            systemPrompt = "Output strictly valid JSON.";
+            userPrompt = `Generate a fact about "${userInterest}" (max 30 words). JSON Format: { "textToType": "..." }`;
+        }
+        // 📚 MODE 5: FLASHCARD (✅ ADDED THIS BLOCK)
+        else if (taskType === 'FlashCard') {
+            systemPrompt = "You are a Study Assistant. Output strictly valid JSON.";
+            userPrompt = `Generate 8 conceptual flashcards about "${userInterest}".
+            JSON Format: { "cards": [{ "front": "Term or Question", "back": "Definition or Answer" }] }`;
         }
 
-        // --- C. QUIZ (Instant Check) ---
-        else if (taskType === 'Quiz') {
-            if (submission.answerIndex === context.answerIndex) {
-                passed = true;
-                creditsEarned = 20;
-                feedback = "Correct! Well done.";
-            } else {
-                passed = false;
-                feedback = "Incorrect. Try again next time.";
-            }
-        }
-
-        // 3. Final Database Update (If Passed)
-        if (passed) {
-            await userRef.update({ xp: admin.firestore.FieldValue.increment(creditsEarned) });
-            return res.json({ success: true, passed: true, credits: creditsEarned, feedback });
-        } else {
-            return res.json({ success: true, passed: false, feedback, hint }); // Return hint if failed
-        }
+        const data = await callGroqAI(systemPrompt, userPrompt, true);
+        res.json(data);
 
     } catch (err) {
-        console.error("Submission Error:", err);
-        res.status(500).json({ error: "Error processing submission." }); 
+        console.error("Task Gen Error:", err);
+        res.status(500).json({ error: "Failed to generate task." });
     }
 });
 
