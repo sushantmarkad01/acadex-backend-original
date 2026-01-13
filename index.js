@@ -340,44 +340,49 @@ app.get('/health', (req, res) => res.json({ status: 'ok', demoMode: DEMO_MODE })
 
 // 1. Create User
 // ✅ UPDATE: Create User (Supports Multiple Subjects per Year)
+// 1. Create User (Updated with Duplicate Checks)
 app.post('/createUser', async (req, res) => {
   try {
-    const { email, password, firstName, lastName, role, instituteId, instituteName, department, assignedClasses, rollNo, qualification, extras = {} } = req.body;
+    const { email, password, firstName, lastName, role, instituteId, instituteName, department, subject, rollNo, qualification, extras = {} } = req.body;
     
-    // Validate assignedClasses for teachers
-    let finalAssignedClasses = [];
-    if (role === 'teacher') {
-        if (assignedClasses && Array.isArray(assignedClasses)) {
-            finalAssignedClasses = assignedClasses; // Expecting [{ year: 'SE', subject: 'Math' }, ...]
-        } else {
-            // Fallback for old requests (backwards compatibility)
-            const { subject, assignedYears } = req.body;
-            if (assignedYears && subject) {
-                finalAssignedClasses = assignedYears.map(y => ({ year: y, subject: subject }));
-            }
+    // --- 1. DUPLICATE CHECKS (Before Creating Auth User) ---
+    if (role === 'student' && instituteId) {
+        // A. Check College ID (Stored in extras or body)
+        const collegeId = extras.collegeId || req.body.collegeId; 
+        if (collegeId) {
+            const existingColId = await admin.firestore().collection('users')
+                .where('instituteId', '==', instituteId)
+                .where('collegeId', '==', collegeId).get();
+            if (!existingColId.empty) return res.status(400).json({ error: `College ID "${collegeId}" is already active.` });
+        }
+
+        // B. Check Roll No
+        if (rollNo && department) {
+            const existingRoll = await admin.firestore().collection('users')
+                .where('instituteId', '==', instituteId)
+                .where('department', '==', department)
+                .where('rollNo', '==', rollNo).get();
+            if (!existingRoll.empty) return res.status(400).json({ error: `Roll No. ${rollNo} already exists in ${department}.` });
         }
     }
 
+    // --- 2. CREATE AUTH USER ---
     const userRecord = await admin.auth().createUser({ email, password, displayName: `${firstName} ${lastName}` });
     
     const userDoc = { 
         uid: userRecord.uid, email, role, firstName, lastName, instituteId, instituteName, 
-        department: department || null,
-        assignedClasses: finalAssignedClasses, // ✅ Store Year-Subject Mapping
-        // Keep legacy fields for safety, but UI should prefer assignedClasses
-        subject: finalAssignedClasses.length > 0 ? finalAssignedClasses[0].subject : null, 
-        assignedYears: finalAssignedClasses.map(c => c.year),
-        rollNo: rollNo || null, 
-        qualification: qualification || null,
+        department: department || null, subject: subject || null, rollNo: rollNo || null, qualification: qualification || null,
         xp: 0, badges: [], 
         createdAt: admin.firestore.FieldValue.serverTimestamp(), ...extras 
     };
-
+    
     await admin.firestore().collection('users').doc(userRecord.uid).set(userDoc);
     await admin.auth().setCustomUserClaims(userRecord.uid, { role, instituteId });
     
     return res.json({ message: 'User created successfully', uid: userRecord.uid });
-  } catch (err) { return res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+      return res.status(500).json({ error: err.message }); 
+  }
 });
 
 // New route for Bulk Student Creation
@@ -640,51 +645,59 @@ app.post('/deleteDepartment', async (req, res) => {
 });
 
 // 11. Submit Student Request
+// 11. Submit Student Request (Updated with Duplicate Checks)
 app.post('/submitStudentRequest', async (req, res) => {
     try {
         const { firstName, lastName, email, rollNo, department, year, semester, collegeId, password, instituteId, instituteName } = req.body;
-        const requestsRef = admin.firestore().collection('student_requests');
-        await requestsRef.add({ firstName, lastName, email, rollNo, department, year, semester, collegeId, password, instituteId, instituteName, status: 'pending', createdAt: admin.firestore.FieldValue.serverTimestamp() });
-        return res.json({ message: 'Success' });
-    } catch (err) { return res.status(500).json({ error: err.message }); }
-});
-
-// 12. Request Leave ( UPDATED TO SUPPORT FILE UPLOAD)
-app.post('/requestLeave', upload.single('document'), async (req, res) => {
-  try {
-    const { uid, name, rollNo, department, reason, fromDate, toDate, instituteId } = req.body;
-    const file = req.file;
-    let documentUrl = null;
-
-    // Upload to Cloudinary if file exists
-    if (file) {
-        try {
-            documentUrl = await uploadToCloudinary(file.buffer);
-        } catch (uploadError) {
-            console.error("Cloudinary Upload Failed:", uploadError);
-            return res.status(500).json({ error: "Document upload failed" });
+        
+        // --- 1. Check for Duplicates in Active Users ---
+        // A. Check College ID
+        if (collegeId) {
+            const activeColId = await admin.firestore().collection('users')
+                .where('instituteId', '==', instituteId)
+                .where('collegeId', '==', collegeId).get();
+            if (!activeColId.empty) return res.status(400).json({ error: `College ID "${collegeId}" is already registered.` });
         }
+
+        // B. Check Roll No (in same Department)
+        if (rollNo && department) {
+            const activeRoll = await admin.firestore().collection('users')
+                .where('instituteId', '==', instituteId)
+                .where('department', '==', department)
+                .where('rollNo', '==', rollNo).get();
+            if (!activeRoll.empty) return res.status(400).json({ error: `Roll No. ${rollNo} already exists in ${department}.` });
+        }
+
+        // --- 2. Check for Duplicates in Pending Requests ---
+        // A. Check College ID in Requests
+        const pendingColId = await admin.firestore().collection('student_requests')
+            .where('instituteId', '==', instituteId)
+            .where('collegeId', '==', collegeId)
+            .where('status', '==', 'pending').get(); // Only check pending ones
+        if (!pendingColId.empty) return res.status(400).json({ error: `A request with College ID "${collegeId}" is already pending.` });
+
+        // B. Check Roll No in Requests
+        const pendingRoll = await admin.firestore().collection('student_requests')
+            .where('instituteId', '==', instituteId)
+            .where('department', '==', department)
+            .where('rollNo', '==', rollNo)
+            .where('status', '==', 'pending').get();
+        if (!pendingRoll.empty) return res.status(400).json({ error: `A request for Roll No. ${rollNo} is already pending.` });
+
+        // --- 3. Proceed to Save Request ---
+        const requestsRef = admin.firestore().collection('student_requests');
+        await requestsRef.add({ 
+            firstName, lastName, email, rollNo, department, year, semester, 
+            collegeId, password, instituteId, instituteName, 
+            status: 'pending', 
+            createdAt: admin.firestore.FieldValue.serverTimestamp() 
+        });
+        
+        return res.json({ message: 'Success' });
+
+    } catch (err) { 
+        return res.status(500).json({ error: err.message }); 
     }
-
-    await admin.firestore().collection('leave_requests').add({
-      studentId: uid, 
-      studentName: name, 
-      rollNo, 
-      department, 
-      reason, 
-      fromDate, 
-      toDate, 
-      instituteId,
-      documentUrl, //  Save the Proof URL
-      status: 'pending', 
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    return res.json({ message: 'Leave request sent successfully!' });
-  } catch (err) { 
-      console.error(err);
-      return res.status(500).json({ error: err.message }); 
-  }
 });
 
 // 13. Action Leave
