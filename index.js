@@ -435,6 +435,7 @@ app.post('/bulkCreateStudents', async (req, res) => {
 
 // Route 2: Mark Attendance
 // ✅ UPDATE: Strict Attendance Marking
+// Route: Mark Attendance (Updated for Device Binding & Biometrics)
 app.post('/markAttendance', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -443,45 +444,67 @@ app.post('/markAttendance', async (req, res) => {
 
     const decoded = await admin.auth().verifyIdToken(token);
     const studentUid = decoded.uid;
-    const { sessionId, studentLocation } = req.body;
+    
+    // ✅ Extract new fields: deviceId and verificationMethod
+    const { sessionId, studentLocation, deviceId, verificationMethod } = req.body;
 
+    // 1️⃣ HANDLE SESSION ID & TIMESTAMP
+    // If Biometric, sessionId is just the ID. If QR, it might be ID|Timestamp.
     const [realSessionId, timestamp] = sessionId.split('|');
-    if (!realSessionId) return res.status(400).json({ error: 'Invalid QR Code' });
+    if (!realSessionId) return res.status(400).json({ error: 'Invalid Session ID' });
 
-    // QR Expiry Check (15 seconds)
-    if (timestamp) {
+    // ✅ Only check QR timestamp if method is NOT biometric
+    if (verificationMethod !== 'biometric' && timestamp) {
         const qrTime = parseInt(timestamp);
-        if ((Date.now() - qrTime) / 1000 > 15) return res.status(400).json({ error: 'QR Code Expired!' });
+        const timeDiff = (Date.now() - qrTime) / 1000;
+        if (timeDiff > 15) return res.status(400).json({ error: 'QR Code Expired!' });
     }
 
+    // 2️⃣ CHECK SESSION STATUS
     const sessionRef = admin.firestore().collection('live_sessions').doc(realSessionId);
     const sessionSnap = await sessionRef.get();
-    if (!sessionSnap.exists || !sessionSnap.data().isActive) return res.status(404).json({ error: 'Session not active' });
+    if (!sessionSnap.exists || !sessionSnap.data().isActive) {
+        return res.status(404).json({ error: 'Session not active' });
+    }
 
     const session = sessionSnap.data();
     
-    // Geo-Location Check
+    // 3️⃣ GEO-LOCATION CHECK (Always Required)
     if (!DEMO_MODE) {
         if (!session.location || !studentLocation) return res.status(400).json({ error: 'Location data missing' });
         const dist = getDistance(session.location.latitude, session.location.longitude, studentLocation.latitude, studentLocation.longitude);
-        if (dist > ACCEPTABLE_RADIUS_METERS) return res.status(403).json({ error: `Too far! You are ${Math.round(dist)}m away.` });
+        if (dist > ACCEPTABLE_RADIUS_METERS) {
+            return res.status(403).json({ error: `Too far! You are ${Math.round(dist)}m away from class.` });
+        }
     }
 
     const userRef = admin.firestore().collection('users').doc(studentUid);
     const userDoc = await userRef.get();
     const studentData = userDoc.data();
 
-    // 🔒 SECURITY: Strict Year Check
-    // If the session has a specific year (not 'All'), reject students from other years.
-    if (session.targetYear && session.targetYear !== 'All' && studentData.year !== session.targetYear) {
-       return res.status(403).json({ error: `⛔ This class is strictly for ${session.targetYear} students.` });
+    // 🛑 4️⃣ PROXY PREVENTION: DEVICE BINDING LOGIC 🛑
+    if (!DEMO_MODE) {
+        // A. If the account is already bound to a device, check if it matches
+        if (studentData.registeredDeviceId && studentData.registeredDeviceId !== deviceId) {
+            console.warn(`Proxy Attempt: User ${studentUid} used ${deviceId} but is bound to ${studentData.registeredDeviceId}`);
+            return res.status(403).json({ 
+                error: '🚫 DEVICE MISMATCH: You can only mark attendance from your registered device. Please login on your own phone.' 
+            });
+        }
+
+        // B. If no device is bound yet, bind this device to the student account PERMANENTLY
+        if (!studentData.registeredDeviceId && deviceId) {
+            await userRef.update({ 
+                registeredDeviceId: deviceId,
+                deviceRegisteredAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+        }
     }
 
-    // Mark Attendance
+    // 5️⃣ MARK ATTENDANCE
     await admin.firestore().collection('attendance').doc(`${realSessionId}_${studentUid}`).set({
       sessionId: realSessionId,
       subject: session.subject || 'Class',
-      targetYear: session.targetYear || 'All', // Save year for filtering reports
       studentId: studentUid,
       studentEmail: studentData.email,
       firstName: studentData.firstName,
@@ -489,10 +512,15 @@ app.post('/markAttendance', async (req, res) => {
       rollNo: studentData.rollNo,
       instituteId: studentData.instituteId,
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      status: 'Present'
+      status: 'Present',
+      method: verificationMethod || 'qr', // ✅ Log how they marked it (qr or biometric)
+      deviceId: deviceId || 'unknown'      // ✅ Log the device used
     });
 
-    await userRef.update({ attendanceCount: admin.firestore.FieldValue.increment(1) });
+    // 6️⃣ UPDATE STATS
+    await userRef.update({
+        attendanceCount: admin.firestore.FieldValue.increment(1)
+    });
 
     return res.json({ message: 'Attendance Marked Successfully!' });
 
@@ -517,6 +545,39 @@ app.post('/chat', async (req, res) => {
         const data = await response.json();
         res.json({ reply: data.choices?.[0]?.message?.content || "No response." });
     } catch (error) { res.status(500).json({ reply: "Brain buffering..." }); }
+});
+
+// Route: Reset Device Lock (For Teachers/Admins to unlock a student)
+app.post('/resetDevice', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.split('Bearer ')[1];
+    if (!token) return res.status(401).json({ error: 'Missing token' });
+
+    // Verify requester is authorized (Teacher or Admin)
+    const decoded = await admin.auth().verifyIdToken(token);
+    const requesterRef = await admin.firestore().collection('users').doc(decoded.uid).get();
+    const requesterData = requesterRef.data();
+
+    if (!requesterData || (requesterData.role !== 'teacher' && requesterData.role !== 'institute-admin' && requesterData.role !== 'super-admin')) {
+        return res.status(403).json({ error: "Unauthorized: Only teachers/admins can reset devices." });
+    }
+
+    const { studentId } = req.body;
+    if (!studentId) return res.status(400).json({ error: "Student ID required" });
+
+    // Delete the device lock
+    await admin.firestore().collection('users').doc(studentId).update({
+        registeredDeviceId: admin.firestore.FieldValue.delete(),
+        deviceRegisteredAt: admin.firestore.FieldValue.delete()
+    });
+
+    return res.json({ message: "Device lock reset successfully. Student can now link a new device." });
+
+  } catch (err) {
+    console.error("Reset Device Error:", err);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // 4. Generate Notes
