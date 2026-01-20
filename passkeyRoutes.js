@@ -62,11 +62,15 @@ router.get('/register-start', async (req, res) => {
 });
 
 // 2. VERIFY REGISTRATION (FINISH SETUP)
+// 2. VERIFY REGISTRATION (FINISH SETUP)
 router.post('/register-finish', async (req, res) => {
-    const { userId, data } = req.body;
+    // ✅ Now receiving deviceId from the frontend during registration
+    const { userId, data, deviceId } = req.body; 
     const expectedChallenge = challengeStore[userId];
 
-    if (!expectedChallenge) return res.status(400).json({ error: 'Challenge expired. Try again.' });
+    if (!expectedChallenge) {
+        return res.status(400).json({ error: 'Challenge expired. Please try again.' });
+    }
 
     try {
         const verification = await verifyRegistrationResponse({
@@ -86,16 +90,17 @@ router.post('/register-finish', async (req, res) => {
                 transports: registrationInfo.transports || [] 
             };
 
-            // Save to Firestore
+            // ✅ STRICT BINDING: Save both the fingerprint AND the physical Device ID
             await db.collection('users').doc(userId).update({
-                authenticators: admin.firestore.FieldValue.arrayUnion(newAuthenticator)
+                authenticators: admin.firestore.FieldValue.arrayUnion(newAuthenticator),
+                registeredDeviceId: deviceId, // Locks the account to this hardware
+                deviceRegisteredAt: admin.firestore.FieldValue.serverTimestamp()
             });
 
             delete challengeStore[userId];
             res.json({ verified: true });
         } else {
-            console.error("🔒 VERIFICATION FAILED: Signature Invalid");
-            res.status(400).json({ verified: false, error: "Signature Invalid" });
+            res.status(400).json({ verified: false, error: "Verification failed" });
         }
     } catch (error) {
         console.error("🔒 VERIFY ERROR:", error);
