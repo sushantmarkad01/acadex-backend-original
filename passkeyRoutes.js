@@ -18,6 +18,9 @@ const db = admin.firestore();
 const RP_ID = 'localhost'; 
 const ORIGIN = 'http://localhost:3000'; 
 
+const RP_ID = 'acadexonline.in'; 
+const ORIGIN = 'https://acadexonline.in';
+
 // 🚀 FOR PRODUCTION (Uncomment and use this when you deploy to the web)
 // const RP_ID = 'scheduplan-1b51d.web.app'; 
 // const ORIGIN = 'https://scheduplan-1b51d.web.app'; 
