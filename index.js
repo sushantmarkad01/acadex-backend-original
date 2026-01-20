@@ -434,8 +434,10 @@ app.post('/bulkCreateStudents', async (req, res) => {
 });
 
 // Route 2: Mark Attendance
-// ✅ UPDATE: Strict Attendance Marking
-// Route: Mark Attendance (Updated for Device Binding & Biometrics)
+/**
+ * Route: Mark Attendance
+ * Features: Device Binding, Biometric Fallback, Location Verification, and Dynamic QR Expiry
+ */
 app.post('/markAttendance', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -445,18 +447,19 @@ app.post('/markAttendance', async (req, res) => {
     const decoded = await admin.auth().verifyIdToken(token);
     const studentUid = decoded.uid;
     
-    // ✅ Extract new fields: deviceId and verificationMethod
+    // Extract new fields: deviceId and verificationMethod for proxy prevention
     const { sessionId, studentLocation, deviceId, verificationMethod } = req.body;
 
-    // 1️⃣ HANDLE SESSION ID & TIMESTAMP
+    // 1️⃣ HANDLE SESSION ID & QR TIMESTAMP
     // If Biometric, sessionId is just the ID. If QR, it might be ID|Timestamp.
     const [realSessionId, timestamp] = sessionId.split('|');
     if (!realSessionId) return res.status(400).json({ error: 'Invalid Session ID' });
 
-    // ✅ Only check QR timestamp if method is NOT biometric
+    // Only check QR rotation timestamp if method is NOT biometric
     if (verificationMethod !== 'biometric' && timestamp) {
         const qrTime = parseInt(timestamp);
         const timeDiff = (Date.now() - qrTime) / 1000;
+        // Block if the QR code is older than 15 seconds
         if (timeDiff > 15) return res.status(400).json({ error: 'QR Code Expired!' });
     }
 
@@ -469,10 +472,15 @@ app.post('/markAttendance', async (req, res) => {
 
     const session = sessionSnap.data();
     
-    // 3️⃣ GEO-LOCATION CHECK (Always Required)
+    // 3️⃣ GEO-LOCATION CHECK
     if (!DEMO_MODE) {
         if (!session.location || !studentLocation) return res.status(400).json({ error: 'Location data missing' });
-        const dist = getDistance(session.location.latitude, session.location.longitude, studentLocation.latitude, studentLocation.longitude);
+        const dist = getDistance(
+            session.location.latitude, 
+            session.location.longitude, 
+            studentLocation.latitude, 
+            studentLocation.longitude
+        );
         if (dist > ACCEPTABLE_RADIUS_METERS) {
             return res.status(403).json({ error: `Too far! You are ${Math.round(dist)}m away from class.` });
         }
@@ -484,15 +492,15 @@ app.post('/markAttendance', async (req, res) => {
 
     // 🛑 4️⃣ PROXY PREVENTION: DEVICE BINDING LOGIC 🛑
     if (!DEMO_MODE) {
-        // A. If the account is already bound to a device, check if it matches
+        // A. Check if the account is already locked to another physical device
         if (studentData.registeredDeviceId && studentData.registeredDeviceId !== deviceId) {
             console.warn(`Proxy Attempt: User ${studentUid} used ${deviceId} but is bound to ${studentData.registeredDeviceId}`);
             return res.status(403).json({ 
-                error: '🚫 DEVICE MISMATCH: You can only mark attendance from your registered device. Please login on your own phone.' 
+                error: '🚫 DEVICE MISMATCH: This account is locked to another device. You cannot mark attendance from this phone.' 
             });
         }
 
-        // B. If no device is bound yet, bind this device to the student account PERMANENTLY
+        // B. First successful attendance? Bind this physical device to the account permanently
         if (!studentData.registeredDeviceId && deviceId) {
             await userRef.update({ 
                 registeredDeviceId: deviceId,
@@ -501,7 +509,7 @@ app.post('/markAttendance', async (req, res) => {
         }
     }
 
-    // 5️⃣ MARK ATTENDANCE
+    // 5️⃣ SAVE ATTENDANCE RECORD
     await admin.firestore().collection('attendance').doc(`${realSessionId}_${studentUid}`).set({
       sessionId: realSessionId,
       subject: session.subject || 'Class',
@@ -513,11 +521,11 @@ app.post('/markAttendance', async (req, res) => {
       instituteId: studentData.instituteId,
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
       status: 'Present',
-      method: verificationMethod || 'qr', // ✅ Log how they marked it (qr or biometric)
-      deviceId: deviceId || 'unknown'      // ✅ Log the device used
+      method: verificationMethod || 'qr', // Logs whether QR or Fingerprint was used
+      deviceId: deviceId || 'unknown'      // Logs the physical hardware ID used
     });
 
-    // 6️⃣ UPDATE STATS
+    // 6️⃣ UPDATE STUDENT STATS
     await userRef.update({
         attendanceCount: admin.firestore.FieldValue.increment(1)
     });
@@ -525,26 +533,9 @@ app.post('/markAttendance', async (req, res) => {
     return res.json({ message: 'Attendance Marked Successfully!' });
 
   } catch (err) {
-    console.error(err);
+    console.error("Attendance Error:", err);
     return res.status(500).json({ error: err.message });
   }
-});
-// 3. AI Chatbot (Groq)
-app.post('/chat', async (req, res) => {
-    try {
-        const { message, userContext } = req.body;
-        const apiKey = process.env.GROQ_API_KEY;
-        if (!apiKey) return res.status(500).json({ reply: "Server Error: API Key missing." });
-
-        const systemPrompt = `You are 'AcadeX Coach' for ${userContext.firstName}.`;
-        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-            method: "POST",
-            headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ messages: [{ role: "system", content: systemPrompt }, { role: "user", content: message }], model: "llama-3.3-70b-versatile" })
-        });
-        const data = await response.json();
-        res.json({ reply: data.choices?.[0]?.message?.content || "No response." });
-    } catch (error) { res.status(500).json({ reply: "Brain buffering..." }); }
 });
 
 // Route: Reset Device Lock (For Teachers/Admins to unlock a student)
