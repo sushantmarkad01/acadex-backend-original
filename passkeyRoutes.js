@@ -1,8 +1,10 @@
+// ✅ 1. Add Crypto Polyfill for older Node.js versions
 const { webcrypto } = require('node:crypto');
 
 if (!globalThis.crypto) {
     globalThis.crypto = webcrypto;
 }
+
 const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin'); 
@@ -16,22 +18,14 @@ const {
 const db = admin.firestore();
 
 // ------------------------------------------------------------------------
-// ⚠️ CONFIGURATION: DOMAIN & ORIGIN
+// ⚠️ CONFIGURATION: DOMAIN & ORIGIN (acadexonline.in)
 // ------------------------------------------------------------------------
-
-// ✅ PRODUCTION SETTINGS (For acadexonline.in)
 const RP_ID = 'acadexonline.in'; 
 const ORIGIN = 'https://acadexonline.in'; 
 
-// 🛠️ FOR LOCAL TESTING (Comment out production settings and use these for localhost)
-// const RP_ID = 'localhost'; 
-// const ORIGIN = 'http://localhost:3000'; 
-
-// ------------------------------------------------------------------------
-
 const challengeStore = {}; 
 
-// 1. REGISTRATION (SETUP)
+// 1. REGISTRATION START (SETUP)
 router.get('/register-start', async (req, res) => {
     const { userId } = req.query;
     if(!userId) return res.status(400).json({ error: "User ID required" });
@@ -41,20 +35,20 @@ router.get('/register-start', async (req, res) => {
         if (!userDoc.exists) return res.status(404).json({ error: "User not found" });
         const user = userDoc.data() || {};
 
-        // ✅ FIX: Convert string userId to Uint8Array
+        // ✅ FIX: Convert string userId to Uint8Array as required by newer library versions
         const userIdentifier = Uint8Array.from(userId, c => c.charCodeAt(0));
 
         const options = await generateRegistrationOptions({
-            rpName: 'AcadeX',
-            rpID: 'acadexonline.in',
-            userID: userIdentifier, // 👈 Now passing Uint8Array instead of String
+            rpName: 'AcadeX Attendance',
+            rpID: RP_ID,
+            userID: userIdentifier, 
             userName: user.email || 'User',
             userDisplayName: `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'Student',
             attestationType: 'none',
             authenticatorSelection: {
                 residentKey: 'preferred',
                 userVerification: 'preferred',
-                authenticatorAttachment: 'platform', 
+                authenticatorAttachment: 'platform', // Forces TouchID/FaceID
             },
         });
 
@@ -62,12 +56,12 @@ router.get('/register-start', async (req, res) => {
         res.json(options);
 
     } catch (error) {
-        console.error("❌ BACKEND ERROR:", error);
+        console.error("❌ BACKEND ERROR DURING REGISTRATION START:", error);
         res.status(500).json({ error: "Server failed to generate security challenge: " + error.message });
     }
 });
 
-// 2. VERIFY REGISTRATION
+// 2. VERIFY REGISTRATION (FINISH SETUP)
 router.post('/register-finish', async (req, res) => {
     const { userId, data } = req.body;
     const expectedChallenge = challengeStore[userId];
@@ -92,6 +86,7 @@ router.post('/register-finish', async (req, res) => {
                 transports: registrationInfo.transports || [] 
             };
 
+            // Save to Firestore
             await db.collection('users').doc(userId).update({
                 authenticators: admin.firestore.FieldValue.arrayUnion(newAuthenticator)
             });
@@ -108,7 +103,7 @@ router.post('/register-finish', async (req, res) => {
     }
 });
 
-// 3. LOGIN START
+// 3. LOGIN START (ATTENDANCE MARKING)
 router.get('/login-start', async (req, res) => {
     const { userId } = req.query;
     try {
@@ -119,6 +114,9 @@ router.get('/login-start', async (req, res) => {
         if (!user.authenticators || user.authenticators.length === 0) {
             return res.status(400).json({ error: 'No passkeys registered' });
         }
+
+        // ✅ FIX: Use consistent encoding for identification
+        const userIdentifier = Uint8Array.from(userId, c => c.charCodeAt(0));
 
         const options = await generateAuthenticationOptions({
             rpID: RP_ID,
@@ -138,7 +136,7 @@ router.get('/login-start', async (req, res) => {
     }
 });
 
-// 4. LOGIN FINISH
+// 4. LOGIN FINISH (VERIFY ATTENDANCE SCAN)
 router.post('/login-finish', async (req, res) => {
     const { userId, data } = req.body;
     try {
