@@ -27,6 +27,7 @@ const ORIGIN = 'https://acadexonline.in';
 const challengeStore = {}; 
 
 // 1. REGISTRATION (SETUP)
+// 1. REGISTRATION (SETUP) - UPDATED FOR PRODUCTION
 router.get('/register-start', async (req, res) => {
     const { userId } = req.query;
     if(!userId) return res.status(400).json({ error: "User ID required" });
@@ -36,24 +37,29 @@ router.get('/register-start', async (req, res) => {
         if (!userDoc.exists) return res.status(404).json({ error: "User not found" });
         const user = userDoc.data() || {};
 
+        // ✅ Robust Options Generation
         const options = await generateRegistrationOptions({
-            rpName: 'AcadeX App',
-            rpID: RP_ID, 
-            userID: String(userId),
+            rpName: 'AcadeX',
+            rpID: 'acadexonline.in', // Must be the domain only
+            userID: userId,          // Simplewebauthn will handle string IDs
             userName: user.email || 'User',
+            userDisplayName: `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'Student',
+            attestationType: 'none',
             authenticatorSelection: {
                 residentKey: 'preferred',
                 userVerification: 'preferred',
-                authenticatorAttachment: 'platform', // Forces TouchID/FaceID
+                authenticatorAttachment: 'platform', // Forces phone biometric (TouchID/FaceID)
             },
         });
 
+        // Store challenge temporarily
         challengeStore[userId] = options.challenge;
         res.json(options);
 
     } catch (error) {
-        console.error("🔒 REGISTRATION START ERROR:", error);
-        res.status(500).json({ error: error.message });
+        // ✅ Check your Render/Backend logs for this specific message
+        console.error("❌ BACKEND CRASH DURING REGISTER-START:", error);
+        res.status(500).json({ error: "Server failed to generate security challenge: " + error.message });
     }
 });
 
