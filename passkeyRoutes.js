@@ -14,16 +14,13 @@ const db = admin.firestore();
 // ⚠️ CONFIGURATION: DOMAIN & ORIGIN
 // ------------------------------------------------------------------------
 
-// ✅ FOR LOCAL TESTING (Use this when running on localhost:3000)
-const RP_ID = 'localhost'; 
-const ORIGIN = 'http://localhost:3000'; 
-
+// ✅ PRODUCTION SETTINGS (For acadexonline.in)
 const RP_ID = 'acadexonline.in'; 
-const ORIGIN = 'https://acadexonline.in';
+const ORIGIN = 'https://acadexonline.in'; 
 
-// 🚀 FOR PRODUCTION (Uncomment and use this when you deploy to the web)
-// const RP_ID = 'scheduplan-1b51d.web.app'; 
-// const ORIGIN = 'https://scheduplan-1b51d.web.app'; 
+// 🛠️ FOR LOCAL TESTING (Comment out production settings and use these for localhost)
+// const RP_ID = 'localhost'; 
+// const ORIGIN = 'http://localhost:3000'; 
 
 // ------------------------------------------------------------------------
 
@@ -39,10 +36,9 @@ router.get('/register-start', async (req, res) => {
         if (!userDoc.exists) return res.status(404).json({ error: "User not found" });
         const user = userDoc.data() || {};
 
-        // Generate options
         const options = await generateRegistrationOptions({
             rpName: 'AcadeX App',
-            rpID: RP_ID, // Must match browser domain
+            rpID: RP_ID, 
             userID: String(userId),
             userName: user.email || 'User',
             authenticatorSelection: {
@@ -72,7 +68,7 @@ router.post('/register-finish', async (req, res) => {
         const verification = await verifyRegistrationResponse({
             response: data,
             expectedChallenge,
-            expectedOrigin: ORIGIN, // Must match browser URL
+            expectedOrigin: ORIGIN, 
             expectedRPID: RP_ID,
         });
 
@@ -86,7 +82,6 @@ router.post('/register-finish', async (req, res) => {
                 transports: registrationInfo.transports || [] 
             };
 
-            // Save to DB
             await db.collection('users').doc(userId).update({
                 authenticators: admin.firestore.FieldValue.arrayUnion(newAuthenticator)
             });
@@ -141,7 +136,6 @@ router.post('/login-finish', async (req, res) => {
         const user = userDoc.data();
         const expectedChallenge = challengeStore[userId];
         
-        // Find the authenticator in DB
         const authData = user.authenticators.find(auth => auth.credentialID === data.id);
         if (!authData) return res.status(400).send('Authenticator not found');
 
@@ -153,13 +147,12 @@ router.post('/login-finish', async (req, res) => {
         const verification = await verifyAuthenticationResponse({
             response: data,
             expectedChallenge,
-            expectedOrigin: ORIGIN, // Strictly checks http://localhost:3000
+            expectedOrigin: ORIGIN, 
             expectedRPID: RP_ID,
             authenticator,
         });
 
         if (verification.verified) {
-            // Update counter to prevent replay attacks
             const updatedAuths = user.authenticators.map(auth => {
                 if (auth.credentialID === data.id) {
                     return { ...auth, counter: verification.authenticationInfo.newCounter };
