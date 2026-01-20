@@ -1,3 +1,9 @@
+import { webcrypto } from 'node:crypto';
+
+// ✅ This manually adds the missing Crypto API to your environment
+if (!globalThis.crypto) {
+    globalThis.crypto = webcrypto;
+}
 const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin'); 
