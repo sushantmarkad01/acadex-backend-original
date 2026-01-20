@@ -10,9 +10,19 @@ const {
 
 const db = admin.firestore();
 
-// 🚨 MUST MATCH YOUR FRONTEND URL EXACTLY
-const RP_ID = 'scheduplan-1b51d.web.app'; 
-const ORIGIN = 'https://scheduplan-1b51d.web.app'; 
+// ------------------------------------------------------------------------
+// ⚠️ CONFIGURATION: DOMAIN & ORIGIN
+// ------------------------------------------------------------------------
+
+// ✅ FOR LOCAL TESTING (Use this when running on localhost:3000)
+const RP_ID = 'localhost'; 
+const ORIGIN = 'http://localhost:3000'; 
+
+// 🚀 FOR PRODUCTION (Uncomment and use this when you deploy to the web)
+// const RP_ID = 'scheduplan-1b51d.web.app'; 
+// const ORIGIN = 'https://scheduplan-1b51d.web.app'; 
+
+// ------------------------------------------------------------------------
 
 const challengeStore = {}; 
 
@@ -26,17 +36,16 @@ router.get('/register-start', async (req, res) => {
         if (!userDoc.exists) return res.status(404).json({ error: "User not found" });
         const user = userDoc.data() || {};
 
-        // Generate options (Simplified to prevent crashes)
+        // Generate options
         const options = await generateRegistrationOptions({
             rpName: 'AcadeX App',
-            rpID: RP_ID,
+            rpID: RP_ID, // Must match browser domain
             userID: String(userId),
             userName: user.email || 'User',
-            // We temporarily remove 'excludeCredentials' to stop the 500 crash
             authenticatorSelection: {
                 residentKey: 'preferred',
                 userVerification: 'preferred',
-                authenticatorAttachment: 'platform', 
+                authenticatorAttachment: 'platform', // Forces TouchID/FaceID
             },
         });
 
@@ -44,8 +53,7 @@ router.get('/register-start', async (req, res) => {
         res.json(options);
 
     } catch (error) {
-        console.error("🔥 REGISTRATION ERROR:", error);
-        // This will print the REAL error to your Render logs
+        console.error("🔒 REGISTRATION START ERROR:", error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -55,13 +63,13 @@ router.post('/register-finish', async (req, res) => {
     const { userId, data } = req.body;
     const expectedChallenge = challengeStore[userId];
 
-    if (!expectedChallenge) return res.status(400).json({ error: 'Challenge expired' });
+    if (!expectedChallenge) return res.status(400).json({ error: 'Challenge expired. Try again.' });
 
     try {
         const verification = await verifyRegistrationResponse({
             response: data,
             expectedChallenge,
-            expectedOrigin: ORIGIN,
+            expectedOrigin: ORIGIN, // Must match browser URL
             expectedRPID: RP_ID,
         });
 
@@ -72,8 +80,10 @@ router.post('/register-finish', async (req, res) => {
                 credentialID: registrationInfo.credentialID,
                 credentialPublicKey: registrationInfo.credentialPublicKey.toString('base64'),
                 counter: registrationInfo.counter,
+                transports: registrationInfo.transports || [] 
             };
 
+            // Save to DB
             await db.collection('users').doc(userId).update({
                 authenticators: admin.firestore.FieldValue.arrayUnion(newAuthenticator)
             });
@@ -81,10 +91,11 @@ router.post('/register-finish', async (req, res) => {
             delete challengeStore[userId];
             res.json({ verified: true });
         } else {
-            res.status(400).json({ verified: false });
+            console.error("🔒 VERIFICATION FAILED: Signature Invalid");
+            res.status(400).json({ verified: false, error: "Signature Invalid" });
         }
     } catch (error) {
-        console.error("🔥 VERIFY ERROR:", error);
+        console.error("🔒 VERIFY ERROR:", error);
         res.status(400).json({ error: error.message });
     }
 });
@@ -97,17 +108,16 @@ router.get('/login-start', async (req, res) => {
         if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
         const user = userDoc.data();
 
-        // Safety check for empty authenticators
         if (!user.authenticators || user.authenticators.length === 0) {
             return res.status(400).json({ error: 'No passkeys registered' });
         }
 
         const options = await generateAuthenticationOptions({
             rpID: RP_ID,
-            // Only map if valid
             allowCredentials: user.authenticators.map(auth => ({
                 id: auth.credentialID,
                 type: 'public-key',
+                transports: auth.transports,
             })),
             userVerification: 'preferred',
         });
@@ -115,7 +125,7 @@ router.get('/login-start', async (req, res) => {
         challengeStore[userId] = options.challenge;
         res.json(options);
     } catch (error) {
-        console.error("🔥 LOGIN START ERROR:", error);
+        console.error("🔒 LOGIN START ERROR:", error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -128,6 +138,7 @@ router.post('/login-finish', async (req, res) => {
         const user = userDoc.data();
         const expectedChallenge = challengeStore[userId];
         
+        // Find the authenticator in DB
         const authData = user.authenticators.find(auth => auth.credentialID === data.id);
         if (!authData) return res.status(400).send('Authenticator not found');
 
@@ -139,13 +150,13 @@ router.post('/login-finish', async (req, res) => {
         const verification = await verifyAuthenticationResponse({
             response: data,
             expectedChallenge,
-            expectedOrigin: ORIGIN,
+            expectedOrigin: ORIGIN, // Strictly checks http://localhost:3000
             expectedRPID: RP_ID,
             authenticator,
         });
 
         if (verification.verified) {
-            // Update counter
+            // Update counter to prevent replay attacks
             const updatedAuths = user.authenticators.map(auth => {
                 if (auth.credentialID === data.id) {
                     return { ...auth, counter: verification.authenticationInfo.newCounter };
@@ -157,10 +168,11 @@ router.post('/login-finish', async (req, res) => {
             delete challengeStore[userId];
             res.json({ verified: true });
         } else {
+            console.error("🔒 LOGIN FAILED: Signature Mismatch");
             res.status(400).json({ verified: false });
         }
     } catch (error) {
-        console.error("🔥 LOGIN FINISH ERROR:", error);
+        console.error("🔒 LOGIN FINISH ERROR:", error);
         res.status(400).json({ error: error.message });
     }
 });
