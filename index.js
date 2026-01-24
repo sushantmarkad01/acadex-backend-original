@@ -385,50 +385,62 @@ app.post('/quizAttempt', async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ status: 'ok', demoMode: DEMO_MODE }));
 
-// 1. Create User
-// ✅ UPDATE: Create User (Supports Multiple Subjects per Year)
-// 1. Create User (Updated with Duplicate Checks)
+// 1. Create User (Updated to save assignedClasses)
 app.post('/createUser', async (req, res) => {
   try {
-    const { email, password, firstName, lastName, role, instituteId, instituteName, department, subject, rollNo, qualification, extras = {} } = req.body;
-    
-    // --- 1. DUPLICATE CHECKS (Before Creating Auth User) ---
-    if (role === 'student' && instituteId) {
-        // A. Check College ID (Stored in extras or body)
-        const collegeId = extras.collegeId || req.body.collegeId; 
-        if (collegeId) {
-            const existingColId = await admin.firestore().collection('users')
-                .where('instituteId', '==', instituteId)
-                .where('collegeId', '==', collegeId).get();
-            if (!existingColId.empty) return res.status(400).json({ error: `College ID "${collegeId}" is already active.` });
-        }
+    const { 
+        email, 
+        password, 
+        firstName, 
+        lastName, 
+        role, 
+        instituteId, 
+        instituteName, 
+        department, 
+        subject, 
+        rollNo, 
+        qualification,
+        assignedClasses, // ✅ EXTRACT THIS FROM REQUEST
+        extras = {} 
+    } = req.body;
 
-        // B. Check Roll No
-        if (rollNo && department) {
-            const existingRoll = await admin.firestore().collection('users')
-                .where('instituteId', '==', instituteId)
-                .where('department', '==', department)
-                .where('rollNo', '==', rollNo).get();
-            if (!existingRoll.empty) return res.status(400).json({ error: `Roll No. ${rollNo} already exists in ${department}.` });
-        }
-    }
+    // Create user in Firebase Auth
+    const userRecord = await admin.auth().createUser({ 
+        email, 
+        password, 
+        displayName: `${firstName} ${lastName}` 
+    });
 
-    // --- 2. CREATE AUTH USER ---
-    const userRecord = await admin.auth().createUser({ email, password, displayName: `${firstName} ${lastName}` });
-    
+    // Prepare Firestore Document
     const userDoc = { 
-        uid: userRecord.uid, email, role, firstName, lastName, instituteId, instituteName, 
-        department: department || null, subject: subject || null, rollNo: rollNo || null, qualification: qualification || null,
-        xp: 0, badges: [], 
-        createdAt: admin.firestore.FieldValue.serverTimestamp(), ...extras 
+        uid: userRecord.uid, 
+        email, 
+        role, 
+        firstName, 
+        lastName, 
+        instituteId, 
+        instituteName, 
+        department: department || null, 
+        subject: subject || null, // Legacy fallback
+        assignedClasses: assignedClasses || [], // ✅ SAVE THIS ARRAY TO FIRESTORE
+        rollNo: rollNo || null, 
+        qualification: qualification || null,
+        xp: 0, 
+        badges: [], 
+        createdAt: admin.firestore.FieldValue.serverTimestamp(), 
+        ...extras 
     };
-    
+
+    // Save to 'users' collection
     await admin.firestore().collection('users').doc(userRecord.uid).set(userDoc);
-    await admin.auth().setCustomUserClaims(userRecord.uid, { role, instituteId });
     
+    // Set Custom Claims
+    await admin.auth().setCustomUserClaims(userRecord.uid, { role, instituteId });
+
     return res.json({ message: 'User created successfully', uid: userRecord.uid });
+
   } catch (err) { 
-      return res.status(500).json({ error: err.message }); 
+    return res.status(500).json({ error: err.message }); 
   }
 });
 
