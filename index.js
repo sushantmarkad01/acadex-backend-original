@@ -433,11 +433,8 @@ app.post('/bulkCreateStudents', async (req, res) => {
   }
 });
 
-// Route 2: Mark Attendance
-/**
- * Route: Mark Attendance
- * Features: Device Binding, Biometric Fallback, Location Verification, and Dynamic QR Expiry
- */
+
+// Updated /markAttendance route for backend/index.js
 app.post('/markAttendance', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -447,23 +444,24 @@ app.post('/markAttendance', async (req, res) => {
     const decoded = await admin.auth().verifyIdToken(token);
     const studentUid = decoded.uid;
     
-    // Extract new fields: deviceId and verificationMethod for proxy prevention
-    const { sessionId, studentLocation, deviceId, verificationMethod } = req.body;
+    // Extract deviceId from request body
+    const { sessionId, studentLocation, deviceId } = req.body; 
 
-    // 1️⃣ HANDLE SESSION ID & QR TIMESTAMP
-    // If Biometric, sessionId is just the ID. If QR, it might be ID|Timestamp.
+    if (!deviceId) {
+        return res.status(400).json({ error: 'Security Error: Device ID is missing.' });
+    }
+
+    // 1. Dynamic QR Check (Parsing session ID and timestamp)
     const [realSessionId, timestamp] = sessionId.split('|');
-    if (!realSessionId) return res.status(400).json({ error: 'Invalid Session ID' });
+    if (!realSessionId) return res.status(400).json({ error: 'Invalid QR Code' });
 
-    // Only check QR rotation timestamp if method is NOT biometric
-    if (verificationMethod !== 'biometric' && timestamp) {
+    if (timestamp) {
         const qrTime = parseInt(timestamp);
         const timeDiff = (Date.now() - qrTime) / 1000;
-        // Block if the QR code is older than 15 seconds
+        // Strict 15-second window to prevent photo sharing
         if (timeDiff > 15) return res.status(400).json({ error: 'QR Code Expired!' });
     }
 
-    // 2️⃣ CHECK SESSION STATUS
     const sessionRef = admin.firestore().collection('live_sessions').doc(realSessionId);
     const sessionSnap = await sessionRef.get();
     if (!sessionSnap.exists || !sessionSnap.data().isActive) {
@@ -472,9 +470,11 @@ app.post('/markAttendance', async (req, res) => {
 
     const session = sessionSnap.data();
     
-    // 3️⃣ GEO-LOCATION CHECK
+    // 2. Geo-Location Check (Ensure student is in the classroom)
     if (!DEMO_MODE) {
-        if (!session.location || !studentLocation) return res.status(400).json({ error: 'Location data missing' });
+        if (!session.location || !studentLocation) {
+            return res.status(400).json({ error: 'Location data missing' });
+        }
         const dist = getDistance(
             session.location.latitude, 
             session.location.longitude, 
@@ -482,7 +482,7 @@ app.post('/markAttendance', async (req, res) => {
             studentLocation.longitude
         );
         if (dist > ACCEPTABLE_RADIUS_METERS) {
-            return res.status(403).json({ error: `Too far! You are ${Math.round(dist)}m away from class.` });
+            return res.status(403).json({ error: `Too far! You are ${Math.round(dist)}m away.` });
         }
     }
 
@@ -490,28 +490,37 @@ app.post('/markAttendance', async (req, res) => {
     const userDoc = await userRef.get();
     const studentData = userDoc.data();
 
-    // 🛑 4️⃣ PROXY PREVENTION: DEVICE BINDING LOGIC 🛑
-    if (!DEMO_MODE) {
-        // A. Check if the account is already locked to another physical device
-        if (studentData.registeredDeviceId && studentData.registeredDeviceId !== deviceId) {
-            console.warn(`Proxy Attempt: User ${studentUid} used ${deviceId} but is bound to ${studentData.registeredDeviceId}`);
-            return res.status(403).json({ 
-                error: '🚫 DEVICE MISMATCH: This account is locked to another device. You cannot mark attendance from this phone.' 
-            });
-        }
+    // 3. CRITICAL SECURITY: DEVICE LOCKING
+    // Check if this physical device has already marked attendance for THIS session
+    const deviceCheck = await admin.firestore().collection('attendance')
+        .where('sessionId', '==', realSessionId)
+        .where('deviceId', '==', deviceId)
+        .limit(1).get();
 
-        // B. First successful attendance? Bind this physical device to the account permanently
-        if (!studentData.registeredDeviceId && deviceId) {
-            await userRef.update({ 
-                registeredDeviceId: deviceId,
-                deviceRegisteredAt: admin.firestore.FieldValue.serverTimestamp()
+    if (!deviceCheck.empty) {
+        const existingRecord = deviceCheck.docs[0].data();
+        // If the device was used by a DIFFERENT student ID, reject it
+        if (existingRecord.studentId !== studentUid) {
+            return res.status(403).json({ 
+                error: "Security Violation: This device has already been used to mark attendance for another student in this session." 
             });
         }
     }
 
-    // 5️⃣ SAVE ATTENDANCE RECORD
+    // 4. (Optional) ACCOUNT BINDING: Lock student account to one device forever
+    if (studentData.boundDeviceId && studentData.boundDeviceId !== deviceId) {
+        return res.status(403).json({ 
+            error: "Device Mismatch: You can only mark attendance from your registered device." 
+        });
+    } else if (!studentData.boundDeviceId) {
+        // Bind the device to the account on the first successful use
+        await userRef.update({ boundDeviceId: deviceId });
+    }
+
+    // 5. Create Attendance Receipt
     await admin.firestore().collection('attendance').doc(`${realSessionId}_${studentUid}`).set({
       sessionId: realSessionId,
+      deviceId: deviceId, // Store the device ID in the receipt
       subject: session.subject || 'Class',
       studentId: studentUid,
       studentEmail: studentData.email,
@@ -520,12 +529,10 @@ app.post('/markAttendance', async (req, res) => {
       rollNo: studentData.rollNo,
       instituteId: studentData.instituteId,
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      status: 'Present',
-      method: verificationMethod || 'qr', // Logs whether QR or Fingerprint was used
-      deviceId: deviceId || 'unknown'      // Logs the physical hardware ID used
+      status: 'Present'
     });
 
-    // 6️⃣ UPDATE STUDENT STATS
+    // 6. Update Stats
     await userRef.update({
         attendanceCount: admin.firestore.FieldValue.increment(1)
     });
@@ -533,7 +540,7 @@ app.post('/markAttendance', async (req, res) => {
     return res.json({ message: 'Attendance Marked Successfully!' });
 
   } catch (err) {
-    console.error("Attendance Error:", err);
+    console.error(err);
     return res.status(500).json({ error: err.message });
   }
 });
