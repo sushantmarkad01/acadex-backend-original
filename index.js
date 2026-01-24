@@ -238,6 +238,53 @@ app.get('/notes', async (req, res) => {
   }
 });
 
+// Add to backend/index.js
+app.post('/markInverseAttendance', async (req, res) => {
+    try {
+        const { teacherId, sessionId, absentees, year, department, instituteId, subject } = req.body;
+
+        // 1. Get all students registered in this specific class/dept
+        const studentsSnap = await admin.firestore().collection('users')
+            .where('instituteId', '==', instituteId)
+            .where('department', '==', department)
+            .where('year', '==', year)
+            .where('role', '==', 'student').get();
+
+        const batch = admin.firestore().batch();
+        const attendanceRef = admin.firestore().collection('attendance');
+
+        studentsSnap.forEach(studentDoc => {
+            const student = studentDoc.data();
+            // 2. If student rollNo is NOT in the absentees list, mark them present
+            if (!absentees.includes(student.rollNo)) {
+                const docId = `${sessionId}_${student.uid}`;
+                batch.set(attendanceRef.doc(docId), {
+                    sessionId,
+                    subject,
+                    studentId: student.uid,
+                    rollNo: student.rollNo,
+                    firstName: student.firstName,
+                    lastName: student.lastName,
+                    instituteId,
+                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                    status: 'Present',
+                    markedBy: 'teacher_inverse'
+                }, { merge: true });
+
+                // Increment student's total attendance count
+                batch.update(studentDoc.ref, {
+                    attendanceCount: admin.firestore.FieldValue.increment(1)
+                });
+            }
+        });
+
+        await batch.commit();
+        res.json({ message: "Attendance marked for all except: " + absentees.join(", ") });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // C. Generate or Return Cached Quiz
 app.get('/quiz', async (req, res) => {
   try {
