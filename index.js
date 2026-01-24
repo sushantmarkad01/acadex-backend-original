@@ -445,51 +445,92 @@ app.post('/createUser', async (req, res) => {
 });
 
 // New route for Bulk Student Creation
+// --- Route: Bulk Create Students (Aligned with Excel Headers) ---
 app.post('/bulkCreateStudents', async (req, res) => {
-  try {
-    const { students, instituteId, instituteName } = req.body;
-    const results = { success: [], errors: [] };
-
-    for (const student of students) {
-      try {
-        // 1. Create Auth Account
-        const userRecord = await admin.auth().createUser({
-          email: student.email,
-          password: Math.random().toString(36).slice(-8), // Temporary random password
-          displayName: `${student.firstName} ${student.lastName}`
-        });
-
-        // 2. Prepare Firestore Doc (matching your existing schema)
-        const userDoc = {
-          uid: userRecord.uid,
-          email: student.email,
-          role: 'student',
-          firstName: student.firstName,
-          lastName: student.lastName,
-          instituteId,
-          instituteName,
-          department: student.department,
-          rollNo: student.rollNo,
-          collegeId: student.collegeId,
-          year: student.year,
-          semester: student.semester,
-          xp: 0,
-          badges: [],
-          createdAt: admin.firestore.FieldValue.serverTimestamp()
-        };
-
-        await admin.firestore().collection('users').doc(userRecord.uid).set(userDoc);
-        await admin.auth().setCustomUserClaims(userRecord.uid, { role: 'student', instituteId });
+    try {
+        // We receive the "global" department/year for this batch from the UI
+        const { students, instituteId, instituteName, department, year } = req.body;
         
-        results.success.push(student.email);
-      } catch (err) {
-        results.errors.push({ email: student.email, error: err.message });
-      }
+        if (!students || !Array.isArray(students)) {
+            return res.status(400).json({ error: "Invalid student data" });
+        }
+
+        const results = { success: [], errors: [] };
+
+        for (const student of students) {
+            // 1. Validate Email
+            const email = student['Email'] ? student['Email'].trim() : null;
+            if (!email) {
+                results.errors.push({ name: student['Name'], error: "Missing Email" });
+                continue;
+            }
+
+            try {
+                // 2. Name Splitting Logic (Full Name -> First + Last)
+                // Example: "ABHANG SHUBHAM APPASAHEB"
+                const rawName = student['Name'] || "Student";
+                const nameParts = rawName.trim().split(" ");
+                // First Name is the first word
+                const firstName = nameParts[0]; 
+                // Last Name is everything else joined together
+                const lastName = nameParts.length > 1 ? nameParts.slice(1).join(" ") : "";
+
+                // 3. Generate Random Temp Password
+                const tempPassword = Math.random().toString(36).slice(-10);
+
+                // 4. Create in Firebase Auth
+                const userRecord = await admin.auth().createUser({
+                    email: email,
+                    password: tempPassword,
+                    displayName: rawName
+                });
+
+                // 5. Create in Firestore (Mapping your Excel Headers)
+                await admin.firestore().collection('users').doc(userRecord.uid).set({
+                    uid: userRecord.uid,
+                    email: email,
+                    firstName: firstName,
+                    lastName: lastName,
+                    // Map Excel Headers to Database Fields
+                    rollNo: student['Roll No'] || '',
+                    collegeId: student['Student Id'] || '', // Mapped from "Student Id"
+                    gender: student['Sex'] || '',           // Mapped from "Sex"
+                    category: student['Category'] || '',    // Optional extra info
+                    
+                    // Use the Batch values from the UI
+                    department: department || 'General',
+                    year: year || 'FE',
+                    
+                    role: 'student',
+                    instituteId,
+                    instituteName,
+                    attendanceCount: 0,
+                    xp: 0,
+                    badges: [],
+                    createdAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                // 6. Set Security Claims
+                await admin.auth().setCustomUserClaims(userRecord.uid, { 
+                    role: 'student', 
+                    instituteId 
+                });
+
+                results.success.push(email);
+
+            } catch (err) {
+                console.error(`Failed for ${email}:`, err.message);
+                // Usually fails if email already exists
+                results.errors.push({ email: email, error: err.message });
+            }
+        }
+
+        res.json(results);
+
+    } catch (err) {
+        console.error("Bulk Upload Error:", err);
+        res.status(500).json({ error: err.message });
     }
-    res.json(results);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
 });
 
 
