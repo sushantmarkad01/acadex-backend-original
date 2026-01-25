@@ -20,35 +20,6 @@ const taskLimiter = rateLimit({
     message: { error: "Too many tasks generated. Slow down!" } 
 });
 
-// --- Helper: Send Notification ---
-const sendNotification = async (userId, title, body) => {
-    try {
-        const userDoc = await admin.firestore().collection('users').doc(userId).get();
-        const fcmToken = userDoc.data()?.fcmToken;
-
-        if (fcmToken) {
-            await admin.messaging().send({
-                token: fcmToken,
-                notification: {
-                    title: title,
-                    body: body
-                },
-                // Android specific settings for priority
-                android: {
-                    priority: 'high',
-                    notification: {
-                        sound: 'default',
-                        channelId: 'default'
-                    }
-                }
-            });
-            console.log(`Notification sent to ${userId}`);
-        }
-    } catch (error) {
-        console.error("Notification Error:", error.message);
-    }
-};
-
 // --- RATE LIMITER CONFIG ---
 // Limit requests to 60 per minute per IP to prevent abuse
 const limiter = rateLimit({
@@ -100,25 +71,6 @@ initFirebaseAdmin();
 
 const passkeyRoutes = require('./passkeyRoutes');
 app.use('/auth/passkeys', passkeyRoutes);
-
-// --- HELPER: Send Push Notification ---
-async function sendNotification(userId, title, body) {
-    try {
-        const userDoc = await admin.firestore().collection('users').doc(userId).get();
-        const fcmToken = userDoc.data()?.fcmToken;
-
-        if (fcmToken) {
-            await admin.messaging().send({
-                token: fcmToken,
-                notification: { title, body },
-                android: { priority: 'high' }
-            });
-            console.log(`🔔 Notification sent to ${userId}`);
-        }
-    } catch (error) {
-        console.error("Notification failed:", error.message);
-    }
-}
 
 // --- UTILITIES & HELPERS ---
 
@@ -286,60 +238,114 @@ app.get('/notes', async (req, res) => {
   }
 });
 
-
-
-// Route: Start Session & Notify Students
-app.post('/startSession', async (req, res) => {
+// Add to backend/index.js
+app.post('/markInverseAttendance', async (req, res) => {
     try {
-        const { teacherId, teacherName, subject, department, year, location, instituteId } = req.body;
+        const { teacherId, sessionId, absentees, year, department, instituteId, subject } = req.body;
 
-        // 1. Create Session in Firestore
-        const sessionRef = await admin.firestore().collection('live_sessions').add({
-            teacherId,
-            teacherName,
-            subject,
-            department,
-            targetYear: year,
-            location, // { latitude, longitude }
-            instituteId,
-            isActive: true,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        // 2. Notify Students (Background Process)
-        // Find all students in this Dept + Year
+        // 1. Get all students registered in this specific class/dept
         const studentsSnap = await admin.firestore().collection('users')
             .where('instituteId', '==', instituteId)
-            .where('role', '==', 'student')
             .where('department', '==', department)
             .where('year', '==', year)
-            .get();
+            .where('role', '==', 'student').get();
 
-        const tokens = [];
-        studentsSnap.forEach(doc => {
-            const data = doc.data();
-            if (data.fcmToken) tokens.push(data.fcmToken);
+        const batch = admin.firestore().batch();
+        const attendanceRef = admin.firestore().collection('attendance');
+
+        studentsSnap.forEach(studentDoc => {
+            const student = studentDoc.data();
+            // 2. If student rollNo is NOT in the absentees list, mark them present
+            if (!absentees.includes(student.rollNo)) {
+                const docId = `${sessionId}_${student.uid}`;
+                batch.set(attendanceRef.doc(docId), {
+                    sessionId,
+                    subject,
+                    studentId: student.uid,
+                    rollNo: student.rollNo,
+                    firstName: student.firstName,
+                    lastName: student.lastName,
+                    instituteId,
+                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                    status: 'Present',
+                    markedBy: 'teacher_inverse'
+                }, { merge: true });
+
+                // Increment student's total attendance count
+                batch.update(studentDoc.ref, {
+                    attendanceCount: admin.firestore.FieldValue.increment(1)
+                });
+            }
         });
 
-        if (tokens.length > 0) {
-            // Send Batch Notification
-            await admin.messaging().sendEachForMulticast({
-                tokens: tokens,
-                notification: {
-                    title: `🔴 Class Started: ${subject}`,
-                    body: `${teacherName} has started the class. Tap to mark attendance!`
-                },
-                android: { priority: 'high' }
-            });
-            console.log(`📢 Notified ${tokens.length} students about ${subject}`);
-        }
-
-        return res.json({ message: "Session started & students notified!", sessionId: sessionRef.id });
-
+        await batch.commit();
+        res.json({ message: "Attendance marked for all except: " + absentees.join(", ") });
     } catch (err) {
-        console.error("Start Session Error:", err);
-        return res.status(500).json({ error: err.message });
+        res.status(500).json({ error: err.message });
     }
+});
+
+// C. Generate or Return Cached Quiz
+app.get('/quiz', async (req, res) => {
+  try {
+    const { userId, numQuestions = 5, difficulty = 'medium' } = req.query;
+    if (!userId) return res.status(400).json({ error: "User ID required" });
+
+    const userSnap = await admin.firestore().collection('users').doc(userId).get();
+    const latestTopic = userSnap.data()?.latestTopic;
+
+    if (!latestTopic || !latestTopic.topicName) {
+      return res.status(400).json({ error: "No active topic found." });
+    }
+
+    const topicName = latestTopic.topicName;
+    const cacheKey = computeHash(`${topicName}_quiz_${difficulty}_${numQuestions}_${MODEL_ID}`);
+
+    // 2. Check Cache
+    const quizRef = admin.firestore().collection('quizzes').doc(cacheKey);
+    const quizSnap = await quizRef.get();
+
+    if (quizSnap.exists) {
+      return res.json({ fromCache: true, quiz: quizSnap.data() });
+    }
+
+    // 3. Generate via Groq
+    const systemPrompt = `You are a quiz generator. Return valid JSON only.`;
+    const userPrompt = `Create a ${numQuestions}-question quiz for topic: "${topicName}".
+    Constraints:
+    - Difficulty: ${difficulty}.
+    - Format: Multiple-choice (4 options).
+    - JSON Output Structure:
+    {
+      "quizTitle": "...",
+      "questions": [
+        { "question":"...","options":["...","...","...","..."], "correctIndex":0, "explanation":"..." }
+      ]
+    }`;
+
+    const quizJson = await callGroqAI(systemPrompt, userPrompt, true);
+
+    // 4. Save to Firestore
+    const quizData = {
+      topicName,
+      difficulty,
+      questions: quizJson.questions || [],
+      quizTitle: quizJson.quizTitle || `${topicName} Quiz`,
+      generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      generatedForUserId: userId,
+      prompt: userPrompt,
+      modelVersion: MODEL_ID,
+      hash: cacheKey
+    };
+
+    await quizRef.set(quizData);
+
+    res.json({ fromCache: false, quiz: quizData });
+
+  } catch (err) {
+    console.error("GetQuiz Error:", err);
+    res.status(500).json({ error: "Failed to generate quiz." });
+  }
 });
 
 // D. Quiz Attempt Recording
