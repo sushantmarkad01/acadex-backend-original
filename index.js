@@ -101,6 +101,24 @@ async function uploadToCloudinary(fileBuffer) {
         stream.end(fileBuffer);
     });
 }
+// --- HELPER: Send Push Notification ---
+async function sendNotification(userId, title, body) {
+    try {
+        const userDoc = await admin.firestore().collection('users').doc(userId).get();
+        const fcmToken = userDoc.data()?.fcmToken;
+
+        if (fcmToken) {
+            await admin.messaging().send({
+                token: fcmToken,
+                notification: { title, body },
+                android: { priority: 'high' }
+            });
+            console.log(`🔔 Notification sent to ${userId}`);
+        }
+    } catch (error) {
+        console.error("Notification failed:", error.message);
+    }
+}
 
 // Helper: Recursive Delete (For cleaning up Institutes)
 async function deleteCollection(db, collectionPath, batchSize, queryField, queryValue) {
@@ -178,6 +196,59 @@ app.post('/storeTopic', async (req, res) => {
     console.error("StoreTopic Error:", err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Route: Start Session & Notify Students
+app.post('/startSession', async (req, res) => {
+    try {
+        const { teacherId, teacherName, subject, department, year, location, instituteId } = req.body;
+
+        // 1. Create Session in Firestore
+        const sessionRef = await admin.firestore().collection('live_sessions').add({
+            teacherId,
+            teacherName,
+            subject,
+            department,
+            targetYear: year,
+            location, // { latitude, longitude }
+            instituteId,
+            isActive: true,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // 2. Notify Students (Background Process)
+        const studentsSnap = await admin.firestore().collection('users')
+            .where('instituteId', '==', instituteId)
+            .where('role', '==', 'student')
+            .where('department', '==', department)
+            .where('year', '==', year)
+            .get();
+
+        const tokens = [];
+        studentsSnap.forEach(doc => {
+            const data = doc.data();
+            if (data.fcmToken) tokens.push(data.fcmToken);
+        });
+
+        if (tokens.length > 0) {
+            // Send Batch Notification
+            await admin.messaging().sendEachForMulticast({
+                tokens: tokens,
+                notification: {
+                    title: `🔴 Class Started: ${subject}`,
+                    body: `${teacherName} has started the class. Tap to mark attendance!`
+                },
+                android: { priority: 'high' }
+            });
+            console.log(`📢 Notified ${tokens.length} students about ${subject}`);
+        }
+
+        return res.json({ message: "Session started & students notified!", sessionId: sessionRef.id });
+
+    } catch (err) {
+        console.error("Start Session Error:", err);
+        return res.status(500).json({ error: err.message });
+    }
 });
 
 // B. Generate or Return Cached Notes
@@ -511,7 +582,7 @@ app.post('/bulkCreateStudents', async (req, res) => {
     }
 });
 
-// Updated /markAttendance route for backend/index.js
+// Route 2: Mark Attendance (Updated: Proxy-Free + Notifications)
 app.post('/markAttendance', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -521,98 +592,90 @@ app.post('/markAttendance', async (req, res) => {
     const decoded = await admin.auth().verifyIdToken(token);
     const studentUid = decoded.uid;
     
-    // Extract deviceId from request body
-    const { sessionId, studentLocation, deviceId } = req.body; 
+    // ✅ 1. Receive Device ID from Frontend
+    const { sessionId, studentLocation, deviceId } = req.body;
 
-    if (!deviceId) {
-        return res.status(400).json({ error: 'Security Error: Device ID is missing.' });
-    }
-
-    // 1. Dynamic QR Check (Parsing session ID and timestamp)
+    // Dynamic QR Check
     const [realSessionId, timestamp] = sessionId.split('|');
     if (!realSessionId) return res.status(400).json({ error: 'Invalid QR Code' });
 
     if (timestamp) {
         const qrTime = parseInt(timestamp);
         const timeDiff = (Date.now() - qrTime) / 1000;
-        // Strict 15-second window to prevent photo sharing
-        if (timeDiff > 15) return res.status(400).json({ error: 'QR Code Expired!' });
+        if (timeDiff > 15) return res.status(400).json({ error: 'QR Code Expired! Scan faster.' });
     }
 
     const sessionRef = admin.firestore().collection('live_sessions').doc(realSessionId);
     const sessionSnap = await sessionRef.get();
-    if (!sessionSnap.exists || !sessionSnap.data().isActive) {
-        return res.status(404).json({ error: 'Session not active' });
-    }
+    if (!sessionSnap.exists || !sessionSnap.data().isActive) return res.status(404).json({ error: 'Session not active' });
 
-    const session = sessionSnap.data();
+    const sessionData = sessionSnap.data();
     
-    // 2. Geo-Location Check (Ensure student is in the classroom)
+    // Geo-Location Check
     if (!DEMO_MODE) {
-        if (!session.location || !studentLocation) {
-            return res.status(400).json({ error: 'Location data missing' });
-        }
-        const dist = getDistance(
-            session.location.latitude, 
-            session.location.longitude, 
-            studentLocation.latitude, 
-            studentLocation.longitude
-        );
-        if (dist > ACCEPTABLE_RADIUS_METERS) {
-            return res.status(403).json({ error: `Too far! You are ${Math.round(dist)}m away.` });
+        if (!sessionData.location || !studentLocation) return res.status(400).json({ error: 'Location data missing' });
+        const dist = getDistance(sessionData.location.latitude, sessionData.location.longitude, studentLocation.latitude, studentLocation.longitude);
+        if (dist > ACCEPTABLE_RADIUS_METERS) return res.status(403).json({ error: `Too far! You are ${Math.round(dist)}m away.` });
+    }
+
+    // 🛡️ PROXY CHECK: DEVICE LOCK 🛡️
+    if (deviceId) {
+        // Check if this physical device has already marked attendance for this session
+        const deviceQuery = await admin.firestore().collection('attendance')
+            .where('sessionId', '==', realSessionId)
+            .where('deviceId', '==', deviceId)
+            .get();
+
+        if (!deviceQuery.empty) {
+            // Found a record for this phone. Check who owns it.
+            const existingRecord = deviceQuery.docs[0].data();
+            
+            // If the student ID on file is DIFFERENT from the current requester -> PROXY ATTEMPT
+            if (existingRecord.studentId !== studentUid) {
+                return res.status(403).json({ error: "⚠️ PROXY DETECTED: This device was already used by another student!" });
+            }
         }
     }
 
-    const userRef = admin.firestore().collection('users').doc(studentUid);
+    // Duplicate Check (Student Account Level)
+    const existingEntry = await admin.firestore().collection('attendance').doc(`${realSessionId}_${studentUid}`).get();
+    if (existingEntry.exists) {
+        return res.status(400).json({ error: "Attendance already marked." });
+    }
+
+    const userRef = admin.firestore().collection('users').doc(studentUid); 
     const userDoc = await userRef.get();
     const studentData = userDoc.data();
 
-    // 3. CRITICAL SECURITY: DEVICE LOCKING
-    // Check if this physical device has already marked attendance for THIS session
-    const deviceCheck = await admin.firestore().collection('attendance')
-        .where('sessionId', '==', realSessionId)
-        .where('deviceId', '==', deviceId)
-        .limit(1).get();
-
-    if (!deviceCheck.empty) {
-        const existingRecord = deviceCheck.docs[0].data();
-        // If the device was used by a DIFFERENT student ID, reject it
-        if (existingRecord.studentId !== studentUid) {
-            return res.status(403).json({ 
-                error: "Security Violation: This device has already been used to mark attendance for another student in this session." 
-            });
-        }
-    }
-
-    // 4. (Optional) ACCOUNT BINDING: Lock student account to one device forever
-    if (studentData.boundDeviceId && studentData.boundDeviceId !== deviceId) {
-        return res.status(403).json({ 
-            error: "Device Mismatch: You can only mark attendance from your registered device." 
-        });
-    } else if (!studentData.boundDeviceId) {
-        // Bind the device to the account on the first successful use
-        await userRef.update({ boundDeviceId: deviceId });
-    }
-
-    // 5. Create Attendance Receipt
+    // 2. Save Attendance Receipt
     await admin.firestore().collection('attendance').doc(`${realSessionId}_${studentUid}`).set({
       sessionId: realSessionId,
-      deviceId: deviceId, // Store the device ID in the receipt
-      subject: session.subject || 'Class',
+      subject: sessionData.subject || 'Class',
       studentId: studentUid,
       studentEmail: studentData.email,
       firstName: studentData.firstName,
       lastName: studentData.lastName,
       rollNo: studentData.rollNo,
+      department: sessionData.department, // Save dept context
+      year: sessionData.targetYear,       // Save year context
       instituteId: studentData.instituteId,
+      deviceId: deviceId || 'unknown',    // ✅ Save Device ID for Audit
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
       status: 'Present'
     });
 
-    // 6. Update Stats
+    // 3. Update Scoreboard
     await userRef.update({
-        attendanceCount: admin.firestore.FieldValue.increment(1)
+        attendanceCount: admin.firestore.FieldValue.increment(1),
+        xp: admin.firestore.FieldValue.increment(10) // Bonus XP
     });
+
+    // ✅ 4. SEND NOTIFICATION TO STUDENT
+    await sendNotification(
+        studentUid,
+        "Attendance Marked! ✅",
+        `You are marked present for ${sessionData.subject}. (+10 XP)`
+    );
 
     return res.json({ message: 'Attendance Marked Successfully!' });
 
