@@ -445,20 +445,18 @@ app.post('/createUser', async (req, res) => {
 });
 
 // New route for Bulk Student Creation
-// --- Route: Bulk Create Students (Standardized Version) ---
+// --- Route: Bulk Create Students (Matches New Frontend) ---
 app.post('/bulkCreateStudents', async (req, res) => {
     try {
-        // Note: 'department' and 'year' are now inside each student object from the frontend
         const { students, instituteId, instituteName } = req.body;
-        
         const results = { success: [], errors: [] };
 
         for (const student of students) {
-            // 1. Skip if no email
-            if (!student.email) continue;
+            // 1. Validation (Using the CLEAN key 'email' from frontend)
+            if (!student.email) continue; 
 
             try {
-                // 2. Split Name (The frontend sends full 'name')
+                // 2. Name Logic (Using 'name' from frontend)
                 const nameParts = student.name ? student.name.trim().split(" ") : ["Student"];
                 const firstName = nameParts[0]; 
                 const lastName = nameParts.length > 1 ? nameParts.slice(1).join(" ") : "";
@@ -471,20 +469,18 @@ app.post('/bulkCreateStudents', async (req, res) => {
                     displayName: student.name
                 });
 
-                // 4. Create Firestore Doc (Using CLEAN keys from frontend)
+                // 4. Save to Firestore (Using CLEAN keys from frontend)
                 await admin.firestore().collection('users').doc(userRecord.uid).set({
                     uid: userRecord.uid,
                     email: student.email,
                     firstName: firstName,
                     lastName: lastName,
                     
-                    // Direct mapping from the standardized frontend object
-                    rollNo: student.rollNo,
-                    studentId: student.studentId,
-                    gender: student.gender,
+                    rollNo: student.rollNo || '',
+                    studentId: student.studentId || '',
+                    gender: student.gender || '',
                     category: student.category || '',
                     
-                    // Batch info (Passed inside student object now)
                     department: student.department || 'General',
                     year: student.year || 'FE',
                     
@@ -497,7 +493,12 @@ app.post('/bulkCreateStudents', async (req, res) => {
                     createdAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
-                await admin.auth().setCustomUserClaims(userRecord.uid, { role: 'student', instituteId });
+                // 5. Set Permissions
+                await admin.auth().setCustomUserClaims(userRecord.uid, { 
+                    role: 'student', 
+                    instituteId 
+                });
+
                 results.success.push(student.email);
 
             } catch (err) {
