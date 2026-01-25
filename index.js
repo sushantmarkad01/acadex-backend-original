@@ -445,61 +445,48 @@ app.post('/createUser', async (req, res) => {
 });
 
 // New route for Bulk Student Creation
-// --- Route: Bulk Create Students (Aligned with Excel Headers) ---
+// --- Route: Bulk Create Students (Standardized Version) ---
 app.post('/bulkCreateStudents', async (req, res) => {
     try {
-        // We receive the "global" department/year for this batch from the UI
-        const { students, instituteId, instituteName, department, year } = req.body;
+        // Note: 'department' and 'year' are now inside each student object from the frontend
+        const { students, instituteId, instituteName } = req.body;
         
-        if (!students || !Array.isArray(students)) {
-            return res.status(400).json({ error: "Invalid student data" });
-        }
-
         const results = { success: [], errors: [] };
 
         for (const student of students) {
-            // 1. Validate Email
-            const email = student['Email'] ? student['Email'].trim() : null;
-            if (!email) {
-                results.errors.push({ name: student['Name'], error: "Missing Email" });
-                continue;
-            }
+            // 1. Skip if no email
+            if (!student.email) continue;
 
             try {
-                // 2. Name Splitting Logic (Full Name -> First + Last)
-                // Example: "ABHANG SHUBHAM APPASAHEB"
-                const rawName = student['Name'] || "Student";
-                const nameParts = rawName.trim().split(" ");
-                // First Name is the first word
+                // 2. Split Name (The frontend sends full 'name')
+                const nameParts = student.name ? student.name.trim().split(" ") : ["Student"];
                 const firstName = nameParts[0]; 
-                // Last Name is everything else joined together
                 const lastName = nameParts.length > 1 ? nameParts.slice(1).join(" ") : "";
 
-                // 3. Generate Random Temp Password
+                // 3. Create Auth User
                 const tempPassword = Math.random().toString(36).slice(-10);
-
-                // 4. Create in Firebase Auth
                 const userRecord = await admin.auth().createUser({
-                    email: email,
+                    email: student.email,
                     password: tempPassword,
-                    displayName: rawName
+                    displayName: student.name
                 });
 
-                // 5. Create in Firestore (Mapping your Excel Headers)
+                // 4. Create Firestore Doc (Using CLEAN keys from frontend)
                 await admin.firestore().collection('users').doc(userRecord.uid).set({
                     uid: userRecord.uid,
-                    email: email,
+                    email: student.email,
                     firstName: firstName,
                     lastName: lastName,
-                    // Map Excel Headers to Database Fields
-                    rollNo: student['Roll No'] || '',
-                    collegeId: student['Student Id'] || '', // Mapped from "Student Id"
-                    gender: student['Sex'] || '',           // Mapped from "Sex"
-                    category: student['Category'] || '',    // Optional extra info
                     
-                    // Use the Batch values from the UI
-                    department: department || 'General',
-                    year: year || 'FE',
+                    // Direct mapping from the standardized frontend object
+                    rollNo: student.rollNo,
+                    studentId: student.studentId,
+                    gender: student.gender,
+                    category: student.category || '',
+                    
+                    // Batch info (Passed inside student object now)
+                    department: student.department || 'General',
+                    year: student.year || 'FE',
                     
                     role: 'student',
                     instituteId,
@@ -510,29 +497,21 @@ app.post('/bulkCreateStudents', async (req, res) => {
                     createdAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
-                // 6. Set Security Claims
-                await admin.auth().setCustomUserClaims(userRecord.uid, { 
-                    role: 'student', 
-                    instituteId 
-                });
-
-                results.success.push(email);
+                await admin.auth().setCustomUserClaims(userRecord.uid, { role: 'student', instituteId });
+                results.success.push(student.email);
 
             } catch (err) {
-                console.error(`Failed for ${email}:`, err.message);
-                // Usually fails if email already exists
-                results.errors.push({ email: email, error: err.message });
+                console.error(`Failed: ${student.email}`, err.message);
+                results.errors.push({ email: student.email, error: err.message });
             }
         }
 
         res.json(results);
 
     } catch (err) {
-        console.error("Bulk Upload Error:", err);
         res.status(500).json({ error: err.message });
     }
 });
-
 
 // Updated /markAttendance route for backend/index.js
 app.post('/markAttendance', async (req, res) => {
