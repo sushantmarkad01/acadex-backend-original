@@ -445,18 +445,18 @@ app.post('/createUser', async (req, res) => {
 });
 
 // New route for Bulk Student Creation
-// --- Route: Bulk Create Students (Matches New Frontend) ---
+// --- Route: Bulk Create Students (Corrected Key Matching) ---
 app.post('/bulkCreateStudents', async (req, res) => {
     try {
         const { students, instituteId, instituteName } = req.body;
         const results = { success: [], errors: [] };
 
         for (const student of students) {
-            // 1. Validation (Using the CLEAN key 'email' from frontend)
+            // 1. Validation (Matches frontend key 'email')
             if (!student.email) continue; 
 
             try {
-                // 2. Name Logic (Using 'name' from frontend)
+                // 2. Name Logic (Matches frontend key 'name')
                 const nameParts = student.name ? student.name.trim().split(" ") : ["Student"];
                 const firstName = nameParts[0]; 
                 const lastName = nameParts.length > 1 ? nameParts.slice(1).join(" ") : "";
@@ -469,18 +469,19 @@ app.post('/bulkCreateStudents', async (req, res) => {
                     displayName: student.name
                 });
 
-                // 4. Save to Firestore (Using CLEAN keys from frontend)
+                // 4. Save to Firestore (Keys match Frontend 100%)
                 await admin.firestore().collection('users').doc(userRecord.uid).set({
                     uid: userRecord.uid,
                     email: student.email,
                     firstName: firstName,
                     lastName: lastName,
                     
-                    rollNo: student.rollNo || '',
-                    studentId: student.studentId || '',
-                    gender: student.gender || '',
-                    category: student.category || '',
+                    rollNo: student.rollNo || '',       // Matches frontend 'rollNo'
+                    studentId: student.studentId || '', // Matches frontend 'studentId'
+                    gender: student.gender || '',       // Matches frontend 'gender'
+                    category: student.category || '',   // Matches frontend 'category'
                     
+                    // Batch Info
                     department: student.department || 'General',
                     year: student.year || 'FE',
                     
@@ -493,7 +494,6 @@ app.post('/bulkCreateStudents', async (req, res) => {
                     createdAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
-                // 5. Set Permissions
                 await admin.auth().setCustomUserClaims(userRecord.uid, { 
                     role: 'student', 
                     instituteId 
