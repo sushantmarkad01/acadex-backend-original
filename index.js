@@ -20,6 +20,35 @@ const taskLimiter = rateLimit({
     message: { error: "Too many tasks generated. Slow down!" } 
 });
 
+// --- Helper: Send Notification ---
+const sendNotification = async (userId, title, body) => {
+    try {
+        const userDoc = await admin.firestore().collection('users').doc(userId).get();
+        const fcmToken = userDoc.data()?.fcmToken;
+
+        if (fcmToken) {
+            await admin.messaging().send({
+                token: fcmToken,
+                notification: {
+                    title: title,
+                    body: body
+                },
+                // Android specific settings for priority
+                android: {
+                    priority: 'high',
+                    notification: {
+                        sound: 'default',
+                        channelId: 'default'
+                    }
+                }
+            });
+            console.log(`Notification sent to ${userId}`);
+        }
+    } catch (error) {
+        console.error("Notification Error:", error.message);
+    }
+};
+
 // --- RATE LIMITER CONFIG ---
 // Limit requests to 60 per minute per IP to prevent abuse
 const limiter = rateLimit({
@@ -71,6 +100,25 @@ initFirebaseAdmin();
 
 const passkeyRoutes = require('./passkeyRoutes');
 app.use('/auth/passkeys', passkeyRoutes);
+
+// --- HELPER: Send Push Notification ---
+async function sendNotification(userId, title, body) {
+    try {
+        const userDoc = await admin.firestore().collection('users').doc(userId).get();
+        const fcmToken = userDoc.data()?.fcmToken;
+
+        if (fcmToken) {
+            await admin.messaging().send({
+                token: fcmToken,
+                notification: { title, body },
+                android: { priority: 'high' }
+            });
+            console.log(`🔔 Notification sent to ${userId}`);
+        }
+    } catch (error) {
+        console.error("Notification failed:", error.message);
+    }
+}
 
 // --- UTILITIES & HELPERS ---
 
@@ -239,113 +287,161 @@ app.get('/notes', async (req, res) => {
 });
 
 // Add to backend/index.js
-app.post('/markInverseAttendance', async (req, res) => {
-    try {
-        const { teacherId, sessionId, absentees, year, department, instituteId, subject } = req.body;
-
-        // 1. Get all students registered in this specific class/dept
-        const studentsSnap = await admin.firestore().collection('users')
-            .where('instituteId', '==', instituteId)
-            .where('department', '==', department)
-            .where('year', '==', year)
-            .where('role', '==', 'student').get();
-
-        const batch = admin.firestore().batch();
-        const attendanceRef = admin.firestore().collection('attendance');
-
-        studentsSnap.forEach(studentDoc => {
-            const student = studentDoc.data();
-            // 2. If student rollNo is NOT in the absentees list, mark them present
-            if (!absentees.includes(student.rollNo)) {
-                const docId = `${sessionId}_${student.uid}`;
-                batch.set(attendanceRef.doc(docId), {
-                    sessionId,
-                    subject,
-                    studentId: student.uid,
-                    rollNo: student.rollNo,
-                    firstName: student.firstName,
-                    lastName: student.lastName,
-                    instituteId,
-                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
-                    status: 'Present',
-                    markedBy: 'teacher_inverse'
-                }, { merge: true });
-
-                // Increment student's total attendance count
-                batch.update(studentDoc.ref, {
-                    attendanceCount: admin.firestore.FieldValue.increment(1)
-                });
-            }
-        });
-
-        await batch.commit();
-        res.json({ message: "Attendance marked for all except: " + absentees.join(", ") });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// C. Generate or Return Cached Quiz
-app.get('/quiz', async (req, res) => {
+// Route 2: Mark Attendance (Updated: Proxy-Free + Notifications)
+app.post('/markAttendance', async (req, res) => {
   try {
-    const { userId, numQuestions = 5, difficulty = 'medium' } = req.query;
-    if (!userId) return res.status(400).json({ error: "User ID required" });
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.split('Bearer ')[1];
+    if (!token) return res.status(401).json({ error: 'Missing token' });
 
-    const userSnap = await admin.firestore().collection('users').doc(userId).get();
-    const latestTopic = userSnap.data()?.latestTopic;
+    const decoded = await admin.auth().verifyIdToken(token);
+    const studentUid = decoded.uid;
+    
+    // ✅ 1. Receive Device ID from Frontend
+    const { sessionId, studentLocation, deviceId } = req.body;
 
-    if (!latestTopic || !latestTopic.topicName) {
-      return res.status(400).json({ error: "No active topic found." });
+    // Dynamic QR Check
+    const [realSessionId, timestamp] = sessionId.split('|');
+    if (!realSessionId) return res.status(400).json({ error: 'Invalid QR Code' });
+
+    if (timestamp) {
+        const qrTime = parseInt(timestamp);
+        const timeDiff = (Date.now() - qrTime) / 1000;
+        if (timeDiff > 15) return res.status(400).json({ error: 'QR Code Expired! Scan faster.' });
     }
 
-    const topicName = latestTopic.topicName;
-    const cacheKey = computeHash(`${topicName}_quiz_${difficulty}_${numQuestions}_${MODEL_ID}`);
+    const sessionRef = admin.firestore().collection('live_sessions').doc(realSessionId);
+    const sessionSnap = await sessionRef.get();
+    if (!sessionSnap.exists || !sessionSnap.data().isActive) return res.status(404).json({ error: 'Session not active' });
 
-    // 2. Check Cache
-    const quizRef = admin.firestore().collection('quizzes').doc(cacheKey);
-    const quizSnap = await quizRef.get();
-
-    if (quizSnap.exists) {
-      return res.json({ fromCache: true, quiz: quizSnap.data() });
+    const sessionData = sessionSnap.data();
+    
+    // Geo-Location Check
+    if (!DEMO_MODE) {
+        if (!sessionData.location || !studentLocation) return res.status(400).json({ error: 'Location data missing' });
+        const dist = getDistance(sessionData.location.latitude, sessionData.location.longitude, studentLocation.latitude, studentLocation.longitude);
+        if (dist > ACCEPTABLE_RADIUS_METERS) return res.status(403).json({ error: `Too far! You are ${Math.round(dist)}m away.` });
     }
 
-    // 3. Generate via Groq
-    const systemPrompt = `You are a quiz generator. Return valid JSON only.`;
-    const userPrompt = `Create a ${numQuestions}-question quiz for topic: "${topicName}".
-    Constraints:
-    - Difficulty: ${difficulty}.
-    - Format: Multiple-choice (4 options).
-    - JSON Output Structure:
-    {
-      "quizTitle": "...",
-      "questions": [
-        { "question":"...","options":["...","...","...","..."], "correctIndex":0, "explanation":"..." }
-      ]
-    }`;
+    // 🛡️ PROXY CHECK: DEVICE LOCK 🛡️
+    if (deviceId) {
+        // Check if this physical device has already marked attendance for this session
+        const deviceQuery = await admin.firestore().collection('attendance')
+            .where('sessionId', '==', realSessionId)
+            .where('deviceId', '==', deviceId)
+            .get();
 
-    const quizJson = await callGroqAI(systemPrompt, userPrompt, true);
+        if (!deviceQuery.empty) {
+            // Found a record for this phone. Check who owns it.
+            const existingRecord = deviceQuery.docs[0].data();
+            
+            // If the student ID on file is DIFFERENT from the current requester -> PROXY ATTEMPT
+            if (existingRecord.studentId !== studentUid) {
+                return res.status(403).json({ error: "⚠️ PROXY DETECTED: This device was already used by another student!" });
+            }
+        }
+    }
 
-    // 4. Save to Firestore
-    const quizData = {
-      topicName,
-      difficulty,
-      questions: quizJson.questions || [],
-      quizTitle: quizJson.quizTitle || `${topicName} Quiz`,
-      generatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      generatedForUserId: userId,
-      prompt: userPrompt,
-      modelVersion: MODEL_ID,
-      hash: cacheKey
-    };
+    // Duplicate Check (Student Account Level)
+    const existingEntry = await admin.firestore().collection('attendance').doc(`${realSessionId}_${studentUid}`).get();
+    if (existingEntry.exists) {
+        return res.status(400).json({ error: "Attendance already marked." });
+    }
 
-    await quizRef.set(quizData);
+    const userRef = admin.firestore().collection('users').doc(studentUid); 
+    const userDoc = await userRef.get();
+    const studentData = userDoc.data();
 
-    res.json({ fromCache: false, quiz: quizData });
+    // 2. Save Attendance Receipt
+    await admin.firestore().collection('attendance').doc(`${realSessionId}_${studentUid}`).set({
+      sessionId: realSessionId,
+      subject: sessionData.subject || 'Class',
+      studentId: studentUid,
+      studentEmail: studentData.email,
+      firstName: studentData.firstName,
+      lastName: studentData.lastName,
+      rollNo: studentData.rollNo,
+      department: sessionData.department, // Save dept context
+      year: sessionData.targetYear,       // Save year context
+      instituteId: studentData.instituteId,
+      deviceId: deviceId || 'unknown',    // ✅ Save Device ID for Audit
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      status: 'Present'
+    });
+
+    // 3. Update Scoreboard
+    await userRef.update({
+        attendanceCount: admin.firestore.FieldValue.increment(1),
+        xp: admin.firestore.FieldValue.increment(10) // Bonus XP
+    });
+
+    // ✅ 4. SEND NOTIFICATION TO STUDENT
+    await sendNotification(
+        studentUid,
+        "Attendance Marked! ✅",
+        `You are marked present for ${sessionData.subject}. (+10 XP)`
+    );
+
+    return res.json({ message: 'Attendance Marked Successfully!' });
 
   } catch (err) {
-    console.error("GetQuiz Error:", err);
-    res.status(500).json({ error: "Failed to generate quiz." });
+    console.error(err);
+    return res.status(500).json({ error: err.message });
   }
+});
+
+// Route: Start Session & Notify Students
+app.post('/startSession', async (req, res) => {
+    try {
+        const { teacherId, teacherName, subject, department, year, location, instituteId } = req.body;
+
+        // 1. Create Session in Firestore
+        const sessionRef = await admin.firestore().collection('live_sessions').add({
+            teacherId,
+            teacherName,
+            subject,
+            department,
+            targetYear: year,
+            location, // { latitude, longitude }
+            instituteId,
+            isActive: true,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // 2. Notify Students (Background Process)
+        // Find all students in this Dept + Year
+        const studentsSnap = await admin.firestore().collection('users')
+            .where('instituteId', '==', instituteId)
+            .where('role', '==', 'student')
+            .where('department', '==', department)
+            .where('year', '==', year)
+            .get();
+
+        const tokens = [];
+        studentsSnap.forEach(doc => {
+            const data = doc.data();
+            if (data.fcmToken) tokens.push(data.fcmToken);
+        });
+
+        if (tokens.length > 0) {
+            // Send Batch Notification
+            await admin.messaging().sendEachForMulticast({
+                tokens: tokens,
+                notification: {
+                    title: `🔴 Class Started: ${subject}`,
+                    body: `${teacherName} has started the class. Tap to mark attendance!`
+                },
+                android: { priority: 'high' }
+            });
+            console.log(`📢 Notified ${tokens.length} students about ${subject}`);
+        }
+
+        return res.json({ message: "Session started & students notified!", sessionId: sessionRef.id });
+
+    } catch (err) {
+        console.error("Start Session Error:", err);
+        return res.status(500).json({ error: err.message });
+    }
 });
 
 // D. Quiz Attempt Recording
