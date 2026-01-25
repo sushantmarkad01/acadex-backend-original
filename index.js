@@ -445,23 +445,20 @@ app.post('/createUser', async (req, res) => {
 });
 
 // New route for Bulk Student Creation
-// --- Route: Bulk Create Students (Corrected Key Matching) ---
+// --- Route: Bulk Create Students (Matches 'collegeId') ---
 app.post('/bulkCreateStudents', async (req, res) => {
     try {
         const { students, instituteId, instituteName } = req.body;
         const results = { success: [], errors: [] };
 
         for (const student of students) {
-            // 1. Validation (Matches frontend key 'email')
             if (!student.email) continue; 
 
             try {
-                // 2. Name Logic (Matches frontend key 'name')
                 const nameParts = student.name ? student.name.trim().split(" ") : ["Student"];
                 const firstName = nameParts[0]; 
                 const lastName = nameParts.length > 1 ? nameParts.slice(1).join(" ") : "";
 
-                // 3. Create Auth User
                 const tempPassword = Math.random().toString(36).slice(-10);
                 const userRecord = await admin.auth().createUser({
                     email: student.email,
@@ -469,19 +466,19 @@ app.post('/bulkCreateStudents', async (req, res) => {
                     displayName: student.name
                 });
 
-                // 4. Save to Firestore (Keys match Frontend 100%)
                 await admin.firestore().collection('users').doc(userRecord.uid).set({
                     uid: userRecord.uid,
                     email: student.email,
                     firstName: firstName,
                     lastName: lastName,
                     
-                    rollNo: student.rollNo || '',       // Matches frontend 'rollNo'
-                    studentId: student.studentId || '', // Matches frontend 'studentId'
-                    gender: student.gender || '',       // Matches frontend 'gender'
-                    category: student.category || '',   // Matches frontend 'category'
+                    // ✅ Mapped correctly now
+                    rollNo: student.rollNo || '',
+                    collegeId: student.collegeId || '', // Saved as collegeId in Firestore
+                    gender: student.gender || '',
+                    category: student.category || '',
+                    admissionType: student.admissionType || '',
                     
-                    // Batch Info
                     department: student.department || 'General',
                     year: student.year || 'FE',
                     
