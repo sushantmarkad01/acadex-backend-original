@@ -640,6 +640,7 @@ app.post('/bulkCreateStudents', async (req, res) => {
 });
 
 // Route 2: Mark Attendance (Updated: Proxy-Free + Notifications)
+// Route 2: Mark Attendance (SECURE: Anti-Proxy Device Lock)
 app.post('/markAttendance', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -649,7 +650,7 @@ app.post('/markAttendance', async (req, res) => {
     const decoded = await admin.auth().verifyIdToken(token);
     const studentUid = decoded.uid;
     
-    // ✅ 1. Receive Device ID from Frontend
+    // ✅ 1. Receive Device ID
     const { sessionId, studentLocation, deviceId } = req.body;
 
     // Dynamic QR Check
@@ -666,57 +667,56 @@ app.post('/markAttendance', async (req, res) => {
     const sessionSnap = await sessionRef.get();
     if (!sessionSnap.exists || !sessionSnap.data().isActive) return res.status(404).json({ error: 'Session not active' });
 
-    const sessionData = sessionSnap.data();
+    const session = sessionSnap.data();
     
     // Geo-Location Check
     if (!DEMO_MODE) {
-        if (!sessionData.location || !studentLocation) return res.status(400).json({ error: 'Location data missing' });
-        const dist = getDistance(sessionData.location.latitude, sessionData.location.longitude, studentLocation.latitude, studentLocation.longitude);
+        if (!session.location || !studentLocation) return res.status(400).json({ error: 'Location data missing' });
+        const dist = getDistance(session.location.latitude, session.location.longitude, studentLocation.latitude, studentLocation.longitude);
         if (dist > ACCEPTABLE_RADIUS_METERS) return res.status(403).json({ error: `Too far! You are ${Math.round(dist)}m away.` });
     }
 
-    // 🛡️ PROXY CHECK: DEVICE LOCK 🛡️
+    // 🛡️ PROXY CHECK: DEVICE LOCK (The New Logic) 🛡️
+    // If a device ID is provided, check if it was used by SOMEONE ELSE for THIS session
     if (deviceId) {
-        // Check if this physical device has already marked attendance for this session
         const deviceQuery = await admin.firestore().collection('attendance')
             .where('sessionId', '==', realSessionId)
             .where('deviceId', '==', deviceId)
             .get();
 
         if (!deviceQuery.empty) {
-            // Found a record for this phone. Check who owns it.
             const existingRecord = deviceQuery.docs[0].data();
             
-            // If the student ID on file is DIFFERENT from the current requester -> PROXY ATTEMPT
+            // If the device was used by a DIFFERENT student ID, block it.
             if (existingRecord.studentId !== studentUid) {
-                return res.status(403).json({ error: "⚠️ PROXY DETECTED: This device was already used by another student!" });
+                return res.status(403).json({ 
+                    error: "⚠️ PROXY DETECTED: This device has already been used to mark attendance for this session. You cannot mark for friends!" 
+                });
             }
         }
     }
 
-    // Duplicate Check (Student Account Level)
+    // Standard Duplicate Check (Did THIS student already mark?)
     const existingEntry = await admin.firestore().collection('attendance').doc(`${realSessionId}_${studentUid}`).get();
     if (existingEntry.exists) {
         return res.status(400).json({ error: "Attendance already marked." });
     }
 
-    const userRef = admin.firestore().collection('users').doc(studentUid); 
+    const userRef = admin.firestore().collection('users').doc(studentUid);
     const userDoc = await userRef.get();
     const studentData = userDoc.data();
 
-    // 2. Save Attendance Receipt
+    // 2. Save Attendance Receipt with Device ID
     await admin.firestore().collection('attendance').doc(`${realSessionId}_${studentUid}`).set({
       sessionId: realSessionId,
-      subject: sessionData.subject || 'Class',
+      subject: session.subject || 'Class',
       studentId: studentUid,
       studentEmail: studentData.email,
       firstName: studentData.firstName,
       lastName: studentData.lastName,
       rollNo: studentData.rollNo,
-      department: sessionData.department, // Save dept context
-      year: sessionData.targetYear,       // Save year context
       instituteId: studentData.instituteId,
-      deviceId: deviceId || 'unknown',    // ✅ Save Device ID for Audit
+      deviceId: deviceId || 'unknown', // ✅ Save ID for Audit
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
       status: 'Present'
     });
@@ -724,15 +724,9 @@ app.post('/markAttendance', async (req, res) => {
     // 3. Update Scoreboard
     await userRef.update({
         attendanceCount: admin.firestore.FieldValue.increment(1),
-        xp: admin.firestore.FieldValue.increment(10) // Bonus XP
+        // Optional: Save this device as their "Last Used Device" for future analytics
+        lastDeviceId: deviceId || null 
     });
-
-    // ✅ 4. SEND NOTIFICATION TO STUDENT
-    await sendNotification(
-        studentUid,
-        "Attendance Marked! ✅",
-        `You are marked present for ${sessionData.subject}. (+10 XP)`
-    );
 
     return res.json({ message: 'Attendance Marked Successfully!' });
 
