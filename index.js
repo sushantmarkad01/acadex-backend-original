@@ -199,10 +199,10 @@ app.post('/storeTopic', async (req, res) => {
 });
 
 // Route: Start Session & Notify Students
-// ✅ OPTIMIZED: Start Session (Corrected for React Frontend)
+// ✅ OPTIMIZED: Start Session (With Push Notifications & Practical Filters)
 app.post('/startSession', async (req, res) => {
     try {
-        // 1. EXTRACT Data (Matching your React Code keys)
+        // 1. EXTRACT Data (Matching your React Frontend keys)
         const { 
             teacherId, 
             teacherName, 
@@ -211,12 +211,12 @@ app.post('/startSession', async (req, res) => {
             year, 
             location, 
             instituteId, 
-            type,       // React sends 'type', not 'sessionType'
-            batch,      // React sends 'batch', not 'batchName'
-            rollRange   // ✅ CRITICAL: You were missing this!
+            type,       // 'theory' or 'practical'
+            batch,      // 'A', 'B', etc.
+            rollRange   // { start: 1, end: 20 }
         } = req.body;
 
-        // 2. Check for Active Session
+        // 2. Check for Active Session (Prevent Double Start)
         const existing = await admin.firestore().collection('live_sessions')
             .where('teacherId', '==', teacherId)
             .where('isActive', '==', true)
@@ -224,13 +224,13 @@ app.post('/startSession', async (req, res) => {
 
         if (!existing.empty) return res.status(400).json({ error: "Session already active!" });
 
-        // 3. Construct Notification
+        // 3. Construct Notification Message
         let title = `🔴 Class Started: ${subject}`;
         let body = `${teacherName} has started the class. Tap to mark attendance!`;
 
         if (type === 'practical') {
             title = `🧪 Lab Started: ${subject}`;
-            body = `Batch ${batch || 'A'} (Roll ${rollRange?.start}-${rollRange?.end}) - Practical Started.`;
+            body = `Batch ${batch || 'A'} (${rollRange?.start}-${rollRange?.end}) - Practical Started.`;
         }
 
         // 4. Create Session in Firestore
@@ -242,16 +242,17 @@ app.post('/startSession', async (req, res) => {
             targetYear: year,
             location,
             instituteId,
-            type: type || 'theory',       // Saved as 'type'
-            batch: batch || 'All',        // Saved as 'batch'
-            rollRange: rollRange || null, // ✅ SAVING THE ROLL LIMITS
+            type: type || 'theory',       
+            batch: batch || 'All',        
+            rollRange: rollRange || null, // ✅ Important: Save the Roll Range
             isActive: true,
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // 5. Notify Students (Background)
+        // 5. Notify Students (Background Process)
         (async () => {
             try {
+                // Fetch students who belong to this Class/Year
                 const studentsSnap = await admin.firestore().collection('users')
                     .where('instituteId', '==', instituteId)
                     .where('role', '==', 'student')
@@ -263,17 +264,18 @@ app.post('/startSession', async (req, res) => {
                 studentsSnap.forEach(doc => {
                     const data = doc.data();
                     
-                    // Optional: Filter Notification by Roll No too (to avoid spamming others)
+                    // ✅ SMART FILTER: Only notify relevant students
                     if (type === 'practical' && rollRange && data.rollNo) {
                         const r = parseInt(data.rollNo);
-                        if (r < rollRange.start || r > rollRange.end) return; // Skip if not in batch
+                        // If student is OUTSIDE the batch range, skip them
+                        if (r < rollRange.start || r > rollRange.end) return; 
                     }
 
                     if (data.fcmToken) tokens.push(data.fcmToken);
                 });
 
                 if (tokens.length > 0) {
-                    // Send in chunks of 500 if needed, but for now standard multicast
+                    // Send Notifications (Multicast)
                     await admin.messaging().sendEachForMulticast({
                         tokens: tokens,
                         notification: { title, body },
