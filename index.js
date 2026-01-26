@@ -199,37 +199,57 @@ app.post('/storeTopic', async (req, res) => {
 });
 
 // Route: Start Session & Notify Students
-// --- OPTIMIZED: Start Session (Notifications are now non-blocking for speed) ---
-// ✅ OPTIMIZED: Start Session (Supports Theory vs Practical)
+// ✅ OPTIMIZED: Start Session (Corrected for React Frontend)
 app.post('/startSession', async (req, res) => {
     try {
-        const { teacherId, teacherName, subject, department, year, location, instituteId, sessionType, batchName } = req.body;
+        // 1. EXTRACT Data (Matching your React Code keys)
+        const { 
+            teacherId, 
+            teacherName, 
+            subject, 
+            department, 
+            year, 
+            location, 
+            instituteId, 
+            type,       // React sends 'type', not 'sessionType'
+            batch,      // React sends 'batch', not 'batchName'
+            rollRange   // ✅ CRITICAL: You were missing this!
+        } = req.body;
 
-        // 1. Construct Notification Text
+        // 2. Check for Active Session
+        const existing = await admin.firestore().collection('live_sessions')
+            .where('teacherId', '==', teacherId)
+            .where('isActive', '==', true)
+            .get();
+
+        if (!existing.empty) return res.status(400).json({ error: "Session already active!" });
+
+        // 3. Construct Notification
         let title = `🔴 Class Started: ${subject}`;
         let body = `${teacherName} has started the class. Tap to mark attendance!`;
 
-        if (sessionType === 'Practical') {
+        if (type === 'practical') {
             title = `🧪 Lab Started: ${subject}`;
-            body = `Batch ${batchName || 'A'} - Practical session has started. Tap to scan if you are in this batch.`;
+            body = `Batch ${batch || 'A'} (Roll ${rollRange?.start}-${rollRange?.end}) - Practical Started.`;
         }
 
-        // 2. Create Session IMMEDIATELY
+        // 4. Create Session in Firestore
         const sessionRef = await admin.firestore().collection('live_sessions').add({
             teacherId,
             teacherName,
             subject,
             department,
             targetYear: year,
-            location, 
+            location,
             instituteId,
-            sessionType: sessionType || 'Theory', // 'Theory' or 'Practical'
-            batchName: batchName || null,
+            type: type || 'theory',       // Saved as 'type'
+            batch: batch || 'All',        // Saved as 'batch'
+            rollRange: rollRange || null, // ✅ SAVING THE ROLL LIMITS
             isActive: true,
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // 3. Notify Students in Background
+        // 5. Notify Students (Background)
         (async () => {
             try {
                 const studentsSnap = await admin.firestore().collection('users')
@@ -242,16 +262,24 @@ app.post('/startSession', async (req, res) => {
                 const tokens = [];
                 studentsSnap.forEach(doc => {
                     const data = doc.data();
+                    
+                    // Optional: Filter Notification by Roll No too (to avoid spamming others)
+                    if (type === 'practical' && rollRange && data.rollNo) {
+                        const r = parseInt(data.rollNo);
+                        if (r < rollRange.start || r > rollRange.end) return; // Skip if not in batch
+                    }
+
                     if (data.fcmToken) tokens.push(data.fcmToken);
                 });
 
                 if (tokens.length > 0) {
+                    // Send in chunks of 500 if needed, but for now standard multicast
                     await admin.messaging().sendEachForMulticast({
                         tokens: tokens,
                         notification: { title, body },
                         android: { priority: 'high' }
                     });
-                    console.log(`📢 Sent ${sessionType} notification to ${tokens.length} students.`);
+                    console.log(`📢 Sent notification to ${tokens.length} students.`);
                 }
             } catch (bgError) {
                 console.error("Background Notification Error:", bgError);
