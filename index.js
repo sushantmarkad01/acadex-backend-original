@@ -200,11 +200,21 @@ app.post('/storeTopic', async (req, res) => {
 
 // Route: Start Session & Notify Students
 // --- OPTIMIZED: Start Session (Notifications are now non-blocking for speed) ---
+// ✅ OPTIMIZED: Start Session (Supports Theory vs Practical)
 app.post('/startSession', async (req, res) => {
     try {
-        const { teacherId, teacherName, subject, department, year, location, instituteId } = req.body;
+        const { teacherId, teacherName, subject, department, year, location, instituteId, sessionType, batchName } = req.body;
 
-        // 1. Create Session IMMEDIATELY
+        // 1. Construct Notification Text
+        let title = `🔴 Class Started: ${subject}`;
+        let body = `${teacherName} has started the class. Tap to mark attendance!`;
+
+        if (sessionType === 'Practical') {
+            title = `🧪 Lab Started: ${subject}`;
+            body = `Batch ${batchName || 'A'} - Practical session has started. Tap to scan if you are in this batch.`;
+        }
+
+        // 2. Create Session IMMEDIATELY
         const sessionRef = await admin.firestore().collection('live_sessions').add({
             teacherId,
             teacherName,
@@ -213,11 +223,13 @@ app.post('/startSession', async (req, res) => {
             targetYear: year,
             location, 
             instituteId,
+            sessionType: sessionType || 'Theory', // 'Theory' or 'Practical'
+            batchName: batchName || null,
             isActive: true,
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // 2. Notify Students (Run in background - do NOT await this to keep UI fast)
+        // 3. Notify Students in Background
         (async () => {
             try {
                 const studentsSnap = await admin.firestore().collection('users')
@@ -236,20 +248,16 @@ app.post('/startSession', async (req, res) => {
                 if (tokens.length > 0) {
                     await admin.messaging().sendEachForMulticast({
                         tokens: tokens,
-                        notification: {
-                            title: `🔴 Class Started: ${subject}`,
-                            body: `${teacherName} has started the class. Tap to mark attendance!`
-                        },
+                        notification: { title, body },
                         android: { priority: 'high' }
                     });
-                    console.log(`📢 Background: Notified ${tokens.length} students`);
+                    console.log(`📢 Sent ${sessionType} notification to ${tokens.length} students.`);
                 }
             } catch (bgError) {
                 console.error("Background Notification Error:", bgError);
             }
         })();
 
-        // 3. Return Response Immediately
         return res.json({ message: "Session started!", sessionId: sessionRef.id });
 
     } catch (err) {
