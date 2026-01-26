@@ -199,55 +199,121 @@ app.post('/storeTopic', async (req, res) => {
 });
 
 // Route: Start Session & Notify Students
+// --- OPTIMIZED: Start Session (Notifications are now non-blocking for speed) ---
 app.post('/startSession', async (req, res) => {
     try {
         const { teacherId, teacherName, subject, department, year, location, instituteId } = req.body;
 
-        // 1. Create Session in Firestore
+        // 1. Create Session IMMEDIATELY
         const sessionRef = await admin.firestore().collection('live_sessions').add({
             teacherId,
             teacherName,
             subject,
             department,
             targetYear: year,
-            location, // { latitude, longitude }
+            location, 
             instituteId,
             isActive: true,
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // 2. Notify Students (Background Process)
-        const studentsSnap = await admin.firestore().collection('users')
-            .where('instituteId', '==', instituteId)
-            .where('role', '==', 'student')
-            .where('department', '==', department)
-            .where('year', '==', year)
-            .get();
+        // 2. Notify Students (Run in background - do NOT await this to keep UI fast)
+        (async () => {
+            try {
+                const studentsSnap = await admin.firestore().collection('users')
+                    .where('instituteId', '==', instituteId)
+                    .where('role', '==', 'student')
+                    .where('department', '==', department)
+                    .where('year', '==', year)
+                    .get();
 
-        const tokens = [];
-        studentsSnap.forEach(doc => {
-            const data = doc.data();
-            if (data.fcmToken) tokens.push(data.fcmToken);
-        });
+                const tokens = [];
+                studentsSnap.forEach(doc => {
+                    const data = doc.data();
+                    if (data.fcmToken) tokens.push(data.fcmToken);
+                });
 
-        if (tokens.length > 0) {
-            // Send Batch Notification
-            await admin.messaging().sendEachForMulticast({
-                tokens: tokens,
-                notification: {
-                    title: `🔴 Class Started: ${subject}`,
-                    body: `${teacherName} has started the class. Tap to mark attendance!`
-                },
-                android: { priority: 'high' }
-            });
-            console.log(`📢 Notified ${tokens.length} students about ${subject}`);
-        }
+                if (tokens.length > 0) {
+                    await admin.messaging().sendEachForMulticast({
+                        tokens: tokens,
+                        notification: {
+                            title: `🔴 Class Started: ${subject}`,
+                            body: `${teacherName} has started the class. Tap to mark attendance!`
+                        },
+                        android: { priority: 'high' }
+                    });
+                    console.log(`📢 Background: Notified ${tokens.length} students`);
+                }
+            } catch (bgError) {
+                console.error("Background Notification Error:", bgError);
+            }
+        })();
 
-        return res.json({ message: "Session started & students notified!", sessionId: sessionRef.id });
+        // 3. Return Response Immediately
+        return res.json({ message: "Session started!", sessionId: sessionRef.id });
 
     } catch (err) {
         console.error("Start Session Error:", err);
         return res.status(500).json({ error: err.message });
+    }
+});
+
+// --- FIXED: Mark Inverse Attendance (Fixes Roll No Type Mismatch) ---
+app.post('/markInverseAttendance', async (req, res) => {
+    try {
+        const { teacherId, sessionId, absentees, year, department, instituteId, subject } = req.body;
+
+        // 1. Fetch ALL students in this class
+        const studentsSnap = await admin.firestore().collection('users')
+            .where('instituteId', '==', instituteId)
+            .where('department', '==', department)
+            .where('year', '==', year)
+            .where('role', '==', 'student').get();
+
+        const batch = admin.firestore().batch();
+        const attendanceRef = admin.firestore().collection('attendance');
+        let markedCount = 0;
+
+        // 2. Normalize Absentees Array (Ensure all are strings & trimmed)
+        const absenteeSet = new Set(absentees.map(a => String(a).trim()));
+
+        studentsSnap.forEach(studentDoc => {
+            const student = studentDoc.data();
+            const studentRoll = String(student.rollNo).trim(); // Normalize DB Roll No
+
+            // 3. If student is NOT in the absentee list, mark PRESENT
+            if (!absenteeSet.has(studentRoll)) {
+                const docId = `${sessionId}_${student.uid}`;
+                const attDoc = attendanceRef.doc(docId);
+                
+                batch.set(attDoc, {
+                    sessionId,
+                    subject,
+                    studentId: student.uid,
+                    rollNo: student.rollNo,
+                    firstName: student.firstName,
+                    lastName: student.lastName,
+                    instituteId,
+                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                    status: 'Present',
+                    markedBy: 'teacher_inverse'
+                }, { merge: true }); // Use merge to avoid overwriting if they already scanned
+
+                // Update Stats
+                batch.update(studentDoc.ref, {
+                    attendanceCount: admin.firestore.FieldValue.increment(1),
+                    xp: admin.firestore.FieldValue.increment(5)
+                });
+                markedCount++;
+            }
+        });
+
+        await batch.commit();
+        res.json({ message: `Success! Marked ${markedCount} students as Present.` });
+
+    } catch (err) {
+        console.error("Inverse Attendance Error:", err);
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -309,52 +375,7 @@ app.get('/notes', async (req, res) => {
   }
 });
 
-// Add to backend/index.js
-app.post('/markInverseAttendance', async (req, res) => {
-    try {
-        const { teacherId, sessionId, absentees, year, department, instituteId, subject } = req.body;
 
-        // 1. Get all students registered in this specific class/dept
-        const studentsSnap = await admin.firestore().collection('users')
-            .where('instituteId', '==', instituteId)
-            .where('department', '==', department)
-            .where('year', '==', year)
-            .where('role', '==', 'student').get();
-
-        const batch = admin.firestore().batch();
-        const attendanceRef = admin.firestore().collection('attendance');
-
-        studentsSnap.forEach(studentDoc => {
-            const student = studentDoc.data();
-            // 2. If student rollNo is NOT in the absentees list, mark them present
-            if (!absentees.includes(student.rollNo)) {
-                const docId = `${sessionId}_${student.uid}`;
-                batch.set(attendanceRef.doc(docId), {
-                    sessionId,
-                    subject,
-                    studentId: student.uid,
-                    rollNo: student.rollNo,
-                    firstName: student.firstName,
-                    lastName: student.lastName,
-                    instituteId,
-                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
-                    status: 'Present',
-                    markedBy: 'teacher_inverse'
-                }, { merge: true });
-
-                // Increment student's total attendance count
-                batch.update(studentDoc.ref, {
-                    attendanceCount: admin.firestore.FieldValue.increment(1)
-                });
-            }
-        });
-
-        await batch.commit();
-        res.json({ message: "Attendance marked for all except: " + absentees.join(", ") });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
 
 // C. Generate or Return Cached Quiz
 app.get('/quiz', async (req, res) => {
