@@ -7,28 +7,8 @@ const rateLimit = require('express-rate-limit'); //  3. Import Rate Limiter
 const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
 const { callGroqAI, computeHash, isUnsafe, MODEL_ID } = require('./lib/groqClient'); 
-const nodemailer = require('nodemailer');
+
 require('dotenv').config(); 
-
-
-// ✅ Configure Email Service (Standard TLS on Port 587 - Best for Render)
-const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 587,  // 👈 Change to 587
-    secure: false, // 👈 Must be FALSE for port 587 (it upgrades to secure automatically)
-    auth: {
-        user: 'scheduplan1@gmail.com',
-        pass: 'awuavgdhkwcrjhys'
-    },
-    tls: {
-        ciphers: 'SSLv3', // Helps with cloud server compatibility
-        rejectUnauthorized: false // Fixes some strict firewall issues
-    },
-    // Increased timeouts to prevent early disconnects
-    connectionTimeout: 20000, // 20 seconds
-    greetingTimeout: 20000,
-    socketTimeout: 30000
-});
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -595,85 +575,70 @@ app.post('/createUser', async (req, res) => {
 });
 
 // New route for Bulk Student Creation
-// ✅ ROUTE: Bulk Create Students (Sequential Processing to prevent Gmail Ban)
+// --- Route: Bulk Create Students (Matches 'collegeId') ---
 app.post('/bulkCreateStudents', async (req, res) => {
-    const { students, instituteId, instituteName, department, year } = req.body;
-    const success = [];
-    const errors = [];
+    try {
+        const { students, instituteId, instituteName } = req.body;
+        const results = { success: [], errors: [] };
 
-    console.log(`Starting bulk upload for ${students.length} students...`);
+        for (const student of students) {
+            if (!student.email) continue; 
 
-    // 🛑 CRITICAL CHANGE: Use a FOR LOOP instead of Promise.all
-    // This forces the server to process one student, send the email, wait for it to finish, 
-    // and THEN move to the next. This prevents the "Connection Timeout" error.
-    for (const student of students) {
-        try {
-            // A. Create User in Firebase Auth
-            const userRecord = await admin.auth().createUser({
-                email: student.email,
-                emailVerified: false,
-                password: 'ChangeMe@123',
-                displayName: student.name,
-                disabled: false
-            });
-
-            // B. Create User Profile in Firestore
-            await admin.firestore().collection('users').doc(userRecord.uid).set({
-                uid: userRecord.uid,
-                email: student.email,
-                firstName: student.name.split(' ')[0],
-                lastName: student.name.split(' ').slice(1).join(' ') || '',
-                rollNo: student.rollNo,
-                collegeId: student.collegeId || '',
-                role: 'student',
-                instituteId: instituteId,
-                instituteName: instituteName,
-                department: department,
-                year: year,
-                xp: 0,
-                badges: [],
-                createdAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-
-            // C. GENERATE & SEND RESET LINK (One by One)
             try {
-                const link = await admin.auth().generatePasswordResetLink(student.email);
-                
-                // Send Email
-                await transporter.sendMail({
-                    from: '"AcadeX Admin" <scheduplan1@gmail.com>',
-                    to: student.email,
-                    subject: 'Welcome to AcadeX - Activate Your Account',
-                    html: `
-                        <h3>Welcome, ${student.name}!</h3>
-                        <p>Your account has been created for <b>${instituteName}</b>.</p>
-                        <p><b>Class:</b> ${year} ${department}</p>
-                        <hr/>
-                        <p>Please click the link below to set your secure password and log in:</p>
-                        <a href="${link}" style="display:inline-block; padding: 12px 24px; background: #2563eb; color: white; text-decoration: none; border-radius: 5px; font-weight:bold;">Set Password & Login</a>
-                        <p style="margin-top:20px; color:#666; font-size:12px;">If the button doesn't work, copy this link: ${link}</p>
-                    `
+                const nameParts = student.name ? student.name.trim().split(" ") : ["Student"];
+                const firstName = nameParts[0]; 
+                const lastName = nameParts.length > 1 ? nameParts.slice(1).join(" ") : "";
+
+                const tempPassword = Math.random().toString(36).slice(-10);
+                const userRecord = await admin.auth().createUser({
+                    email: student.email,
+                    password: tempPassword,
+                    displayName: student.name
                 });
-                console.log(`✅ Email sent to ${student.email}`);
-            } catch (emailErr) {
-                console.error(`❌ Failed to email ${student.email}:`, emailErr.message);
-                // We do NOT stop the loop. We just log the error and continue.
+
+                await admin.firestore().collection('users').doc(userRecord.uid).set({
+                    uid: userRecord.uid,
+                    email: student.email,
+                    firstName: firstName,
+                    lastName: lastName,
+                    
+                    // ✅ Mapped correctly now
+                    rollNo: student.rollNo || '',
+                    collegeId: student.collegeId || '', // Saved as collegeId in Firestore
+                    gender: student.gender || '',
+                    category: student.category || '',
+                    admissionType: student.admissionType || '',
+                    
+                    department: student.department || 'General',
+                    year: student.year || 'FE',
+                    
+                    role: 'student',
+                    instituteId,
+                    instituteName,
+                    attendanceCount: 0,
+                    xp: 0,
+                    badges: [],
+                    createdAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                await admin.auth().setCustomUserClaims(userRecord.uid, { 
+                    role: 'student', 
+                    instituteId 
+                });
+
+                results.success.push(student.email);
+
+            } catch (err) {
+                console.error(`Failed: ${student.email}`, err.message);
+                results.errors.push({ email: student.email, error: err.message });
             }
-
-            success.push(student.email);
-
-        } catch (error) {
-            console.error(`❌ Error creating ${student.email}:`, error.message);
-            errors.push({ email: student.email, error: error.message });
         }
-    }
 
-    // Return response ONLY after the loop finishes processing everyone
-    res.json({ 
-        message: `Processed ${students.length} students`, 
-        success, 
-        errors 
-    });
+        res.json(results);
+
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Route 2: Mark Attendance (Updated: Proxy-Free + Notifications)
