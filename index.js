@@ -12,13 +12,21 @@ require('dotenv').config();
 
 
 // ✅ Configure Email Service (Use App Password for Gmail)
+// ✅ Configure Email Service (Robust Settings for Render)
 const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 465,  // Force secure port
+    secure: true, // Use SSL
     auth: {
-        user: 'scheduplan1@gmail.com', 
-        pass: 'awua vgdh kwcr jhys'      
-    }
+        user: 'scheduplan1@gmail.com',
+        pass: 'awua vgdh kwcr jhys'
+    },
+    // Add specific timeouts to prevent it from getting stuck
+    connectionTimeout: 10000, // 10 seconds to connect
+    greetingTimeout: 10000,   // 10 seconds to say hello
+    socketTimeout: 20000      // 20 seconds to send data
 });
+
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json());
