@@ -592,21 +592,24 @@ app.post('/createUser', async (req, res) => {
 });
 
 // New route for Bulk Student Creation
-// --- Route: Bulk Create Students (Matches 'collegeId') ---
-// ✅ ROUTE: Bulk Create Students + Send Reset Emails Internally (No Rate Limits)
+// ✅ ROUTE: Bulk Create Students (Sequential Processing to prevent Gmail Ban)
 app.post('/bulkCreateStudents', async (req, res) => {
     const { students, instituteId, instituteName, department, year } = req.body;
     const success = [];
     const errors = [];
 
-    // Run all creations in parallel for speed
-    await Promise.all(students.map(async (student) => {
+    console.log(`Starting bulk upload for ${students.length} students...`);
+
+    // 🛑 CRITICAL CHANGE: Use a FOR LOOP instead of Promise.all
+    // This forces the server to process one student, send the email, wait for it to finish, 
+    // and THEN move to the next. This prevents the "Connection Timeout" error.
+    for (const student of students) {
         try {
             // A. Create User in Firebase Auth
             const userRecord = await admin.auth().createUser({
                 email: student.email,
                 emailVerified: false,
-                password: 'ChangeMe@123', // Temporary password
+                password: 'ChangeMe@123',
                 displayName: student.name,
                 disabled: false
             });
@@ -621,7 +624,7 @@ app.post('/bulkCreateStudents', async (req, res) => {
                 collegeId: student.collegeId || '',
                 role: 'student',
                 instituteId: instituteId,
-                instituteName: instituteName, // Save Institute Name too
+                instituteName: instituteName,
                 department: department,
                 year: year,
                 xp: 0,
@@ -629,13 +632,13 @@ app.post('/bulkCreateStudents', async (req, res) => {
                 createdAt: admin.firestore.FieldValue.serverTimestamp()
             });
 
-            // C. GENERATE & SEND RESET LINK (Server-Side)
+            // C. GENERATE & SEND RESET LINK (One by One)
             try {
                 const link = await admin.auth().generatePasswordResetLink(student.email);
                 
-                // Send Email via Nodemailer
+                // Send Email
                 await transporter.sendMail({
-                    from: '"AcadeX Admin" <scheduplan1@gmail.com>', // 🔴 Ensure this matches your transporter config
+                    from: '"AcadeX Admin" <scheduplan1@gmail.com>',
                     to: student.email,
                     subject: 'Welcome to AcadeX - Activate Your Account',
                     html: `
@@ -648,19 +651,21 @@ app.post('/bulkCreateStudents', async (req, res) => {
                         <p style="margin-top:20px; color:#666; font-size:12px;">If the button doesn't work, copy this link: ${link}</p>
                     `
                 });
+                console.log(`✅ Email sent to ${student.email}`);
             } catch (emailErr) {
-                console.error(`Failed to email ${student.email}:`, emailErr);
-                // We don't fail the creation if email fails, but we log the error
+                console.error(`❌ Failed to email ${student.email}:`, emailErr.message);
+                // We do NOT stop the loop. We just log the error and continue.
             }
 
             success.push(student.email);
 
         } catch (error) {
-            console.error(`Error creating ${student.email}:`, error);
+            console.error(`❌ Error creating ${student.email}:`, error.message);
             errors.push({ email: student.email, error: error.message });
         }
-    }));
+    }
 
+    // Return response ONLY after the loop finishes processing everyone
     res.json({ 
         message: `Processed ${students.length} students`, 
         success, 
