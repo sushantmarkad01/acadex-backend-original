@@ -11,23 +11,19 @@ const nodemailer = require('nodemailer');
 require('dotenv').config(); 
 
 
-// ✅ Configure Email Service (Standard TLS on Port 587 - Best for Render)
+// ✅ Configure Email Service (Try Port 2525 for Cloud Hosting)
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
-    port: 587,  // 👈 Change to 587
-    secure: false, // 👈 Must be FALSE for port 587 (it upgrades to secure automatically)
+    port: 2525, // 👈 TRY THIS PORT (Often open when 587 is blocked)
+    secure: false, // Must be false for 2525
     auth: {
         user: 'scheduplan1@gmail.com',
         pass: 'awua vgdh kwcr jhys'
     },
     tls: {
-        ciphers: 'SSLv3', // Helps with cloud server compatibility
-        rejectUnauthorized: false // Fixes some strict firewall issues
+        rejectUnauthorized: false
     },
-    // Increased timeouts to prevent early disconnects
-    connectionTimeout: 20000, // 20 seconds
-    greetingTimeout: 20000,
-    socketTimeout: 30000
+    connectionTimeout: 10000
 });
 
 const app = express();
