@@ -15,8 +15,8 @@ require('dotenv').config();
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
-        user: 'scheduplan1@gmail.com', // 🔴 REPLACE THIS with your real email
-        pass: 'sppu@123'      // 🔴 REPLACE THIS with your App Password
+        user: 'scheduplan1@gmail.com', 
+        pass: 'awua vgdh kwcr jhys'      
     }
 });
 const app = express();
