@@ -7,9 +7,18 @@ const rateLimit = require('express-rate-limit'); //  3. Import Rate Limiter
 const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
 const { callGroqAI, computeHash, isUnsafe, MODEL_ID } = require('./lib/groqClient'); 
-
+const nodemailer = require('nodemailer');
 require('dotenv').config(); 
 
+
+// ✅ Configure Email Service (Use App Password for Gmail)
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: 'scheduplan1@gmail.com', // 🔴 REPLACE THIS with your real email
+        pass: 'sppu@123'      // 🔴 REPLACE THIS with your App Password
+    }
+});
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json());
@@ -576,69 +585,79 @@ app.post('/createUser', async (req, res) => {
 
 // New route for Bulk Student Creation
 // --- Route: Bulk Create Students (Matches 'collegeId') ---
+// ✅ ROUTE: Bulk Create Students + Send Reset Emails Internally (No Rate Limits)
 app.post('/bulkCreateStudents', async (req, res) => {
-    try {
-        const { students, instituteId, instituteName } = req.body;
-        const results = { success: [], errors: [] };
+    const { students, instituteId, instituteName, department, year } = req.body;
+    const success = [];
+    const errors = [];
 
-        for (const student of students) {
-            if (!student.email) continue; 
+    // Run all creations in parallel for speed
+    await Promise.all(students.map(async (student) => {
+        try {
+            // A. Create User in Firebase Auth
+            const userRecord = await admin.auth().createUser({
+                email: student.email,
+                emailVerified: false,
+                password: 'ChangeMe@123', // Temporary password
+                displayName: student.name,
+                disabled: false
+            });
 
+            // B. Create User Profile in Firestore
+            await admin.firestore().collection('users').doc(userRecord.uid).set({
+                uid: userRecord.uid,
+                email: student.email,
+                firstName: student.name.split(' ')[0],
+                lastName: student.name.split(' ').slice(1).join(' ') || '',
+                rollNo: student.rollNo,
+                collegeId: student.collegeId || '',
+                role: 'student',
+                instituteId: instituteId,
+                instituteName: instituteName, // Save Institute Name too
+                department: department,
+                year: year,
+                xp: 0,
+                badges: [],
+                createdAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // C. GENERATE & SEND RESET LINK (Server-Side)
             try {
-                const nameParts = student.name ? student.name.trim().split(" ") : ["Student"];
-                const firstName = nameParts[0]; 
-                const lastName = nameParts.length > 1 ? nameParts.slice(1).join(" ") : "";
-
-                const tempPassword = Math.random().toString(36).slice(-10);
-                const userRecord = await admin.auth().createUser({
-                    email: student.email,
-                    password: tempPassword,
-                    displayName: student.name
+                const link = await admin.auth().generatePasswordResetLink(student.email);
+                
+                // Send Email via Nodemailer
+                await transporter.sendMail({
+                    from: '"AcadeX Admin" <scheduplan1@gmail.com>', // 🔴 Ensure this matches your transporter config
+                    to: student.email,
+                    subject: 'Welcome to AcadeX - Activate Your Account',
+                    html: `
+                        <h3>Welcome, ${student.name}!</h3>
+                        <p>Your account has been created for <b>${instituteName}</b>.</p>
+                        <p><b>Class:</b> ${year} ${department}</p>
+                        <hr/>
+                        <p>Please click the link below to set your secure password and log in:</p>
+                        <a href="${link}" style="display:inline-block; padding: 12px 24px; background: #2563eb; color: white; text-decoration: none; border-radius: 5px; font-weight:bold;">Set Password & Login</a>
+                        <p style="margin-top:20px; color:#666; font-size:12px;">If the button doesn't work, copy this link: ${link}</p>
+                    `
                 });
-
-                await admin.firestore().collection('users').doc(userRecord.uid).set({
-                    uid: userRecord.uid,
-                    email: student.email,
-                    firstName: firstName,
-                    lastName: lastName,
-                    
-                    // ✅ Mapped correctly now
-                    rollNo: student.rollNo || '',
-                    collegeId: student.collegeId || '', // Saved as collegeId in Firestore
-                    gender: student.gender || '',
-                    category: student.category || '',
-                    admissionType: student.admissionType || '',
-                    
-                    department: student.department || 'General',
-                    year: student.year || 'FE',
-                    
-                    role: 'student',
-                    instituteId,
-                    instituteName,
-                    attendanceCount: 0,
-                    xp: 0,
-                    badges: [],
-                    createdAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                await admin.auth().setCustomUserClaims(userRecord.uid, { 
-                    role: 'student', 
-                    instituteId 
-                });
-
-                results.success.push(student.email);
-
-            } catch (err) {
-                console.error(`Failed: ${student.email}`, err.message);
-                results.errors.push({ email: student.email, error: err.message });
+            } catch (emailErr) {
+                console.error(`Failed to email ${student.email}:`, emailErr);
+                // We don't fail the creation if email fails, but we log the error
             }
+
+            success.push(student.email);
+
+        } catch (error) {
+            console.error(`Error creating ${student.email}:`, error);
+            errors.push({ email: student.email, error: error.message });
         }
+    }));
 
-        res.json(results);
-
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    res.json({ 
+        message: `Processed ${students.length} students`, 
+        success, 
+        errors 
+    });
 });
 
 // Route 2: Mark Attendance (Updated: Proxy-Free + Notifications)
