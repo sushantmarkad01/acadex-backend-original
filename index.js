@@ -198,6 +198,55 @@ app.post('/storeTopic', async (req, res) => {
   }
 });
 
+// ✅ NEW ROUTE: Manual Mark Present (Single Student)
+app.post('/manualMarkAttendance', async (req, res) => {
+    try {
+        const { sessionId, studentId, subject, instituteId, type, batch } = req.body;
+        
+        // 1. Fetch student details to ensure data consistency
+        const studentDoc = await admin.firestore().collection('users').doc(studentId).get();
+        if (!studentDoc.exists) return res.status(404).json({ error: "Student not found" });
+        const sData = studentDoc.data();
+
+        const recordId = `${sessionId}_${studentId}`;
+        
+        // 2. Use Batch to write Attendance AND Update Stats atomically
+        const batchWrite = admin.firestore().batch();
+        const attRef = admin.firestore().collection('attendance').doc(recordId);
+        const userRef = admin.firestore().collection('users').doc(studentId);
+
+        // A. Create Attendance Receipt
+        batchWrite.set(attRef, {
+            sessionId,
+            subject,
+            studentId,
+            studentEmail: sData.email,
+            firstName: sData.firstName,
+            lastName: sData.lastName,
+            rollNo: sData.rollNo,
+            instituteId,
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            status: 'Present',
+            type: type || 'theory',
+            batch: batch || 'All',
+            markedBy: 'teacher_manual'
+        });
+
+        // B. Update Student Stats (XP + Count)
+        batchWrite.update(userRef, {
+            attendanceCount: admin.firestore.FieldValue.increment(1),
+            xp: admin.firestore.FieldValue.increment(10)
+        });
+
+        await batchWrite.commit();
+        res.json({ message: `Success! Marked ${sData.firstName} Present.` });
+
+    } catch (err) {
+        console.error("Manual Mark Error:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Route: Start Session & Notify Students
 // ✅ OPTIMIZED: Start Session (With Push Notifications & Practical Filters)
 app.post('/startSession', async (req, res) => {
