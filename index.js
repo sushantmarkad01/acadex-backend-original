@@ -623,6 +623,47 @@ app.post('/createUser', async (req, res) => {
   }
 });
 
+// ✅ NEW ROUTE: Submit Leave Request (Student)
+app.post('/requestLeave', upload.single('document'), async (req, res) => {
+    try {
+        const { uid, name, rollNo, department, instituteId, reason, fromDate, toDate } = req.body;
+        const file = req.file;
+
+        let documentUrl = null;
+
+        // 1. Upload Proof to Cloudinary (if provided)
+        if (file) {
+            try {
+                documentUrl = await uploadToCloudinary(file.buffer);
+            } catch (uploadError) {
+                console.error("Cloudinary Upload Error:", uploadError);
+                return res.status(500).json({ error: "Failed to upload proof document." });
+            }
+        }
+
+        // 2. Save to Firestore
+        await admin.firestore().collection('leave_requests').add({
+            studentId: uid,
+            studentName: name,
+            rollNo,
+            department,
+            instituteId,
+            reason,
+            fromDate,
+            toDate,
+            documentUrl: documentUrl, // URL from Cloudinary
+            status: 'pending', // Default status
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        return res.json({ message: "Leave request submitted successfully!" });
+
+    } catch (err) {
+        console.error("Leave Request Error:", err);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
 // New route for Bulk Student Creation
 // --- Route: Bulk Create Students (Matches 'collegeId') ---
 app.post('/bulkCreateStudents', async (req, res) => {
